@@ -272,6 +272,7 @@ function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_messages_recipient_user_id ON messages(recipient_user_id);
     CREATE INDEX IF NOT EXISTS idx_activity_user_id ON contribution_activity(user_id);
     CREATE INDEX IF NOT EXISTS idx_creator_views_viewer ON creator_views(viewer_user_id, creator_id);
+    CREATE INDEX IF NOT EXISTS idx_creator_views_creator ON creator_views(creator_id, viewed_at);
     CREATE INDEX IF NOT EXISTS idx_creator_hides_user ON creator_hides(user_id, creator_id);
     CREATE INDEX IF NOT EXISTS idx_creator_follows_user ON creator_follows(follower_user_id, creator_id);
     CREATE INDEX IF NOT EXISTS idx_creator_follows_creator ON creator_follows(creator_id);
