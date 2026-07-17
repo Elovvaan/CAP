@@ -513,7 +513,7 @@ function readJson(request, maxBytes = maxJsonBytes) {
         if (tooLarge) throw uploadError("Request payload is too large.", 413);
         resolve(body ? JSON.parse(body) : {});
       } catch (error) {
-        reject(error.status ? error : uploadError("Malformed upload payload."));
+        reject(error.status ? error : uploadError("Malformed JSON payload."));
       }
     });
     request.on("error", reject);
