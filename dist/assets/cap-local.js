@@ -8,7 +8,7 @@
     ["Messages", "Messages", "M"],
     ["Settings", "Settings", "S"]
   ];
-  const state = { active: "Home", query: "", data: null, viewingCreator: null, discoveryIndex: 0, status: "" };
+  const state = { active: "Home", query: "", data: null, viewingCreator: null, discoveryIndex: 0, status: "", authUser: null, authMode: "signin", authReady: false };
   const root = document.getElementById("root");
 
   const iconMap = {
@@ -54,6 +54,7 @@
   async function api(path, options = {}) {
     const response = await fetch(path, {
       ...options,
+      credentials: "same-origin",
       headers: { "Content-Type": "application/json", ...(options.headers || {}) }
     });
     const payload = await response.json();
@@ -62,7 +63,16 @@
   }
 
   async function refresh() {
-    state.data = await api("/api/state");
+    const auth = await api("/api/auth/me", { method: "GET" });
+    state.authUser = auth.user || null;
+    state.authReady = true;
+    if (!state.authUser) {
+      state.data = null;
+      render();
+      return;
+    }
+    state.data = await api("/api/state", { method: "GET" });
+    state.authUser = state.data.currentUser;
     render();
   }
 
@@ -287,11 +297,86 @@
   function pageTitle() {
     if (state.active === "Home") return state.data?.profile?.name ? `Welcome back, ${state.data.profile.name}` : "Welcome to CAP";
     if (state.active === "MyProfile") return "My Profile";
+    if (state.active === "Account") return "Account Settings";
     if (state.active === "CreatorProfile") return state.viewingCreator?.name || "Creator Profile";
     return navItems.find(([key]) => key === state.active)?.[1] || "CAP";
   }
 
+  function authView(error = false) {
+    const isCreate = state.authMode === "create";
+    return `<main class="auth-screen">
+      <section class="auth-card panel">
+        <div class="brand-block auth-brand">
+          <div class="brand-mark logo-mark"><img src="./assets/cap-logo.jpg" alt="CAP logo"></div>
+          <div><strong>CAP</strong><span>Creator Association Platform</span></div>
+        </div>
+        <div class="welcome-copy">
+          <h2>${isCreate ? "Create your CAP account" : "Sign in to CAP"}</h2>
+          <p>You're no longer building alone. CAP connects creators, opportunities, and communities around real member records.</p>
+        </div>
+        <div class="status-line ${error ? "error" : ""}">${escapeHtml(state.status)}</div>
+        <form id="${isCreate ? "register-form" : "login-form"}" class="form-grid auth-form">
+          ${isCreate ? field("displayName", "Display name", "") : ""}
+          ${field("email", "Email", "")}
+          ${field("password", "Password", "", "", "password")}
+          ${isCreate ? field("confirmPassword", "Confirm password", "", "", "password") : ""}
+          ${isCreate ? `<p class="empty-copy slim full">Use at least 10 characters. CAP stores only a salted scrypt password hash.</p>` : ""}
+          <div class="form-actions full">
+            <button class="primary-button" type="submit">${isCreate ? "Create Account" : "Sign In"}</button>
+            <button class="secondary-button" type="button" data-auth-toggle>${isCreate ? "Back to Sign In" : "Create Account"}</button>
+          </div>
+        </form>
+      </section>
+    </main>`;
+  }
+
+  function bindAuthForms() {
+    root.querySelector("[data-auth-toggle]")?.addEventListener("click", () => {
+      state.authMode = state.authMode === "create" ? "signin" : "create";
+      state.status = "";
+      render();
+    });
+    root.querySelector("#login-form")?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const payload = formData(event.currentTarget);
+      try {
+        state.status = "Signing in...";
+        await api("/api/auth/login", { method: "POST", body: JSON.stringify(payload) });
+        state.status = "";
+        await refresh();
+      } catch (error) {
+        state.status = "Invalid email or password.";
+        render(true);
+      }
+    });
+    root.querySelector("#register-form")?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const payload = formData(event.currentTarget);
+      try {
+        if (payload.password !== payload.confirmPassword) throw new Error("Passwords do not match.");
+        if (String(payload.password || "").length < 10) throw new Error("Password must be at least 10 characters.");
+        state.status = "Creating account...";
+        await api("/api/auth/register", { method: "POST", body: JSON.stringify(payload) });
+        state.status = "Account created. Start your profile.";
+        state.active = "MyProfile";
+        await refresh();
+      } catch (error) {
+        state.status = error.message;
+        render(true);
+      }
+    });
+  }
+
   function render(error = false) {
+    if (!state.authReady) {
+      root.innerHTML = `<section class="empty-page"><div class="empty-icon">CAP</div><h2>Loading CAP</h2><p>Checking your session...</p></section>`;
+      return;
+    }
+    if (!state.authUser) {
+      root.innerHTML = authView(error);
+      bindAuthForms();
+      return;
+    }
     const data = state.data || { creators: [], circles: [], activity: [], collaborations: [], messages: [], stats: {}, profile: null, circleMembership: [] };
     const profile = data.profile;
     root.innerHTML = `
@@ -320,6 +405,8 @@
             <div class="top-actions">
               <label class="search-box"><span>?</span><input id="global-search" value="${escapeHtml(state.query)}" placeholder="Search creators, skills, circles..."></label>
               <button class="icon-button" aria-label="Notifications">${iconMap.Bell}</button>
+              <button class="secondary-button" data-account>Account Settings</button>
+              <button class="secondary-button" data-sign-out>Sign Out</button>
               <button class="primary-button" data-quick><span>${iconMap.Plus}</span> Quick Action</button>
             </div>
           </header>
@@ -338,6 +425,7 @@
       case "Collaborations": return collaborationsView();
       case "Messages": return messagesView();
       case "MyProfile": return myProfileView();
+      case "Account": return accountView();
       case "CreatorProfile": return creatorProfileView();
       case "Settings": return settingsView();
       default: return homeView();
@@ -828,6 +916,25 @@
     </section>`;
   }
 
+  function accountView() {
+    const user = state.data.currentUser || state.authUser || {};
+    return `<section class="content-grid directory-only">
+      <div class="panel">${panelHeader("Account Settings", "")}
+        <form id="account-form" class="form-grid">
+          ${field("displayName", "Display name", user.displayName || "")}
+          ${field("email", "Email", user.email || "")}
+          ${field("currentPassword", "Current password", "", false, "password")}
+          ${field("newPassword", "New password", "", false, "password")}
+          <p class="empty-copy slim full">Leave password fields blank unless you want to change your password.</p>
+          <div class="form-actions full">
+            <button class="primary-button" type="submit">Save Account</button>
+            <button class="secondary-button" type="button" data-sign-out>Sign Out</button>
+          </div>
+        </form>
+      </div>
+    </section>`;
+  }
+
   function parsePairs(value, secondKey) {
     return String(value || "").split(/\r?\n/).map((line) => {
       const [first, ...rest] = line.split("|");
@@ -919,6 +1026,15 @@
   function bindGlobal() {
     root.querySelectorAll("[data-nav]").forEach((button) => button.addEventListener("click", () => { state.active = button.dataset.nav; state.status = ""; render(); }));
     root.querySelector("[data-my-profile]")?.addEventListener("click", () => { state.active = "MyProfile"; state.status = ""; render(); });
+    root.querySelector("[data-account]")?.addEventListener("click", () => { state.active = "Account"; state.status = ""; render(); });
+    root.querySelectorAll("[data-sign-out]").forEach((button) => button.addEventListener("click", async () => {
+      await api("/api/auth/logout", { method: "POST", body: JSON.stringify({}) });
+      state.authUser = null;
+      state.data = null;
+      state.active = "Home";
+      state.status = "Signed out.";
+      render();
+    }));
     root.querySelector("#global-search")?.addEventListener("input", (event) => { state.query = event.target.value; render(); });
     root.querySelector("[data-quick]")?.addEventListener("click", () => { state.active = "MyProfile"; state.status = ""; render(); });
     root.querySelector("[data-find-first-circle]")?.addEventListener("click", () => {
@@ -1014,6 +1130,17 @@
     root.querySelector("#admin-settings-form")?.addEventListener("submit", (event) => {
       event.preventDefault();
       submit("/api/settings", formData(event.currentTarget));
+    });
+    root.querySelector("#account-form")?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        await api("/api/account", { method: "POST", body: JSON.stringify(formData(event.currentTarget)) });
+        state.status = "Account updated.";
+        await refresh();
+      } catch (error) {
+        state.status = error.message;
+        render(true);
+      }
     });
   }
 

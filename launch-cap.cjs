@@ -13,6 +13,12 @@ const dbPath = process.env.CAP_DB_PATH ? path.resolve(process.env.CAP_DB_PATH) :
 const host = process.env.CAP_HOST || (isHosted ? "0.0.0.0" : "127.0.0.1");
 const preferredPort = Number(process.env.PORT || process.env.CAP_PORT || 1420);
 const logPath = process.env.CAP_LOG_PATH || (isHosted ? path.join(dataDir, "cap-launch.log") : path.join(__dirname, "cap-launch.log"));
+const sessionCookieName = "cap_session";
+const sessionDurationMs = 30 * 24 * 60 * 60 * 1000;
+const maxJsonBytes = 2_000_000;
+const authLimitWindowMs = 15 * 60 * 1000;
+const authLimitMax = 20;
+const authAttempts = new Map();
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -23,6 +29,7 @@ const mimeTypes = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
   ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
   ".ico": "image/x-icon"
 };
 
@@ -38,6 +45,60 @@ function log(message) {
     console.warn(`[CAP] ${message}`);
     console.warn(`[CAP] Could not write log: ${error.message}`);
   }
+}
+
+function tableExists(name) {
+  return Boolean(get("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", [name]));
+}
+
+function columnNames(table) {
+  return new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name));
+}
+
+function indexNames(table) {
+  return new Set(db.prepare(`PRAGMA index_list(${table})`).all().map((row) => row.name));
+}
+
+function backupDatabaseIfNeeded(reason) {
+  if (!fs.existsSync(dbPath)) return;
+  const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+  const backupPath = path.join(dataDir, `cap-pre-auth-${stamp}.db`);
+  if (fs.existsSync(backupPath)) return;
+  fs.copyFileSync(dbPath, backupPath);
+  log(`Created database backup before ${reason}: ${backupPath}`);
+}
+
+function addColumnIfMissing(table, name, ddl) {
+  if (!columnNames(table).has(name)) {
+    backupDatabaseIfNeeded(`adding ${table}.${name}`);
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+  }
+}
+
+function rebuildSavedCreatorsForUsers() {
+  if (!tableExists("saved_creators")) return;
+  const columns = columnNames("saved_creators");
+  const indexes = indexNames("saved_creators");
+  const needsRebuild = !columns.has("user_id") || !indexes.has("idx_saved_creators_user_creator");
+  if (!needsRebuild) return;
+
+  backupDatabaseIfNeeded("saved_creators ownership migration");
+  db.exec(`
+    PRAGMA foreign_keys = OFF;
+    CREATE TABLE IF NOT EXISTS saved_creators_new (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      creator_id INTEGER NOT NULL REFERENCES creators(id) ON DELETE CASCADE,
+      saved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    INSERT OR IGNORE INTO saved_creators_new (user_id, creator_id, saved_at)
+      SELECT NULL, creator_id, COALESCE(saved_at, CURRENT_TIMESTAMP) FROM saved_creators;
+    DROP TABLE saved_creators;
+    ALTER TABLE saved_creators_new RENAME TO saved_creators;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_creators_user_creator
+      ON saved_creators (COALESCE(user_id, -1), creator_id);
+    PRAGMA foreign_keys = ON;
+  `);
 }
 
 function initializeDatabase() {
@@ -133,19 +194,59 @@ function initializeDatabase() {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL DEFAULT ''
     );
+
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      password_hash TEXT NOT NULL,
+      display_name TEXT NOT NULL DEFAULT '',
+      account_type TEXT NOT NULL DEFAULT 'creator',
+      is_admin INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      last_login_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token_hash TEXT NOT NULL UNIQUE,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      user_agent TEXT NOT NULL DEFAULT '',
+      ip_address TEXT NOT NULL DEFAULT ''
+    );
   `);
 
-  const creatorColumns = new Set(db.prepare("PRAGMA table_info(creators)").all().map((column) => column.name));
   const requiredCreatorColumns = [
     ["skills", "skills TEXT NOT NULL DEFAULT ''"],
     ["location", "location TEXT NOT NULL DEFAULT ''"],
     ["portfolio", "portfolio TEXT NOT NULL DEFAULT ''"],
     ["collaboration_interests", "collaboration_interests TEXT NOT NULL DEFAULT ''"],
-    ["looking_for", "looking_for TEXT NOT NULL DEFAULT ''"]
+    ["looking_for", "looking_for TEXT NOT NULL DEFAULT ''"],
+    ["user_id", "user_id INTEGER REFERENCES users(id) ON DELETE SET NULL"]
   ];
   for (const [name, ddl] of requiredCreatorColumns) {
-    if (!creatorColumns.has(name)) db.exec(`ALTER TABLE creators ADD COLUMN ${ddl}`);
+    addColumnIfMissing("creators", name, ddl);
   }
+
+  addColumnIfMissing("creator_circles", "owner_user_id", "owner_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL");
+  addColumnIfMissing("collaboration_requests", "requester_user_id", "requester_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL");
+  addColumnIfMissing("messages", "sender_user_id", "sender_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL");
+  addColumnIfMissing("messages", "recipient_user_id", "recipient_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL");
+  addColumnIfMissing("contribution_activity", "user_id", "user_id INTEGER REFERENCES users(id) ON DELETE SET NULL");
+  rebuildSavedCreatorsForUsers();
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_creators_user_id ON creators(user_id);
+    CREATE INDEX IF NOT EXISTS idx_circles_owner_user_id ON creator_circles(owner_user_id);
+    CREATE INDEX IF NOT EXISTS idx_collaborations_requester_user_id ON collaboration_requests(requester_user_id);
+    CREATE INDEX IF NOT EXISTS idx_messages_sender_user_id ON messages(sender_user_id);
+    CREATE INDEX IF NOT EXISTS idx_messages_recipient_user_id ON messages(recipient_user_id);
+    CREATE INDEX IF NOT EXISTS idx_activity_user_id ON contribution_activity(user_id);
+  `);
+  initializeFounderUser();
 }
 
 function all(sql, params = []) {
@@ -160,6 +261,167 @@ function run(sql, params = []) {
   return db.prepare(sql).run(...params);
 }
 
+function normalizeEmail(value) {
+  return sanitizeText(value).toLowerCase();
+}
+
+function isValidEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || ""));
+}
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16);
+  const keyLength = 64;
+  const n = 16384;
+  const r = 8;
+  const p = 1;
+  const derived = crypto.scryptSync(String(password), salt, keyLength, { N: n, r, p });
+  return `scrypt$N=${n},r=${r},p=${p},len=${keyLength}$${salt.toString("base64url")}$${derived.toString("base64url")}`;
+}
+
+function verifyPassword(password, encoded) {
+  try {
+    const [algorithm, paramText, saltText, hashText] = String(encoded || "").split("$");
+    if (algorithm !== "scrypt") return false;
+    const params = Object.fromEntries(paramText.split(",").map((part) => part.split("=")));
+    const expected = Buffer.from(hashText, "base64url");
+    const actual = crypto.scryptSync(String(password), Buffer.from(saltText, "base64url"), Number(params.len), {
+      N: Number(params.N),
+      r: Number(params.r),
+      p: Number(params.p)
+    });
+    return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+  } catch {
+    return false;
+  }
+}
+
+function tokenHash(token) {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+function parseCookies(request) {
+  return Object.fromEntries(
+    String(request.headers.cookie || "")
+      .split(";")
+      .map((part) => {
+        const [key, ...rest] = part.trim().split("=");
+        const raw = rest.join("=") || "";
+        let value = raw;
+        try {
+          value = decodeURIComponent(raw);
+        } catch {
+          value = raw;
+        }
+        return [key, value];
+      })
+      .filter(([key]) => key)
+  );
+}
+
+function cookieHeader(name, value, options = {}) {
+  const parts = [`${name}=${encodeURIComponent(value)}`, "Path=/", "SameSite=Lax", "HttpOnly"];
+  if (options.maxAge !== undefined) parts.push(`Max-Age=${options.maxAge}`);
+  if (isHosted || options.secure) parts.push("Secure");
+  return parts.join("; ");
+}
+
+function clearSessionCookie() {
+  return cookieHeader(sessionCookieName, "", { maxAge: 0 });
+}
+
+function safeUser(row) {
+  if (!row) return null;
+  const creator = get("SELECT id, image FROM creators WHERE user_id = ? ORDER BY id LIMIT 1", [row.id]);
+  return {
+    id: row.id,
+    email: row.email,
+    displayName: row.display_name,
+    accountType: row.account_type,
+    isAdmin: Boolean(row.is_admin),
+    status: row.status,
+    creatorProfileId: creator?.id || null,
+    image: creator?.image || "",
+    profileComplete: Boolean(creator?.id)
+  };
+}
+
+function currentUserFromRequest(request) {
+  const token = parseCookies(request)[sessionCookieName];
+  if (!token) return null;
+  const session = get(`
+    SELECT s.id AS session_id, s.expires_at, u.*
+    FROM sessions s
+    JOIN users u ON u.id = s.user_id
+    WHERE s.token_hash = ?
+  `, [tokenHash(token)]);
+  if (!session || session.status !== "active") return null;
+  if (new Date(session.expires_at).getTime() <= Date.now()) {
+    run("DELETE FROM sessions WHERE id = ?", [session.session_id]);
+    return null;
+  }
+  run("UPDATE sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ?", [session.session_id]);
+  return session;
+}
+
+function createSession(response, request, userId) {
+  const token = crypto.randomBytes(32).toString("base64url");
+  const expiresAt = new Date(Date.now() + sessionDurationMs).toISOString();
+  run("DELETE FROM sessions WHERE expires_at <= ?", [new Date().toISOString()]);
+  run(
+    "INSERT INTO sessions (user_id, token_hash, expires_at, user_agent, ip_address) VALUES (?, ?, ?, ?, ?)",
+    [userId, tokenHash(token), expiresAt, sanitizeText(request.headers["user-agent"]), sanitizeText(request.socket.remoteAddress)]
+  );
+  response.setHeader("Set-Cookie", cookieHeader(sessionCookieName, token, { maxAge: Math.floor(sessionDurationMs / 1000) }));
+}
+
+function requireUser(request) {
+  const user = currentUserFromRequest(request);
+  if (!user) {
+    const error = new Error("Authentication required.");
+    error.status = 401;
+    throw error;
+  }
+  return user;
+}
+
+function requireAdmin(user) {
+  if (!user?.is_admin) {
+    const error = new Error("Admin access required.");
+    error.status = 403;
+    throw error;
+  }
+}
+
+function initializeFounderUser() {
+  const existingFounder = get("SELECT * FROM users WHERE account_type = 'founder' OR is_admin = 1 ORDER BY id LIMIT 1");
+  const founderCreator = get("SELECT * FROM creators WHERE lower(name) = lower(?) ORDER BY id LIMIT 1", ["Lorenzo Lewis"]);
+  if (existingFounder) {
+    if (founderCreator && !founderCreator.user_id) run("UPDATE creators SET user_id = ? WHERE id = ?", [existingFounder.id, founderCreator.id]);
+    return;
+  }
+
+  const email = normalizeEmail(process.env.CAP_FOUNDER_EMAIL);
+  const password = String(process.env.CAP_FOUNDER_PASSWORD || "");
+  if (!email || !password) {
+    log("Founder account not created. Set CAP_FOUNDER_EMAIL and CAP_FOUNDER_PASSWORD for first-time founder initialization.");
+    return;
+  }
+  if (!isValidEmail(email) || password.length < 10) {
+    log("Founder account not created. CAP_FOUNDER_EMAIL must be valid and CAP_FOUNDER_PASSWORD must be at least 10 characters.");
+    return;
+  }
+
+  const displayName = founderCreator?.name || "Lorenzo Lewis";
+  const result = run(
+    "INSERT INTO users (email, password_hash, display_name, account_type, is_admin) VALUES (?, ?, ?, 'founder', 1)",
+    [email, hashPassword(password), displayName]
+  );
+  const userId = Number(result.lastInsertRowid);
+  if (founderCreator) run("UPDATE creators SET user_id = ? WHERE id = ?", [userId, founderCreator.id]);
+  log(`Founder account initialized for ${email}.`);
+}
+
 function setSetting(key, value) {
   run("INSERT INTO application_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [
     key,
@@ -171,30 +433,43 @@ function getSettings() {
   return Object.fromEntries(all("SELECT key, value FROM application_settings").map((item) => [item.key, item.value]));
 }
 
-function setRecentActivity(type, id, label) {
-  setSetting("lastActivity", { type, id, label, at: new Date().toISOString() });
+function userSettingKey(user, key) {
+  return user?.id ? `user:${user.id}:${key}` : key;
 }
 
-function markCreatorViewed(creatorId) {
+function setRecentActivity(type, id, label, user = null) {
+  setSetting(userSettingKey(user, "lastActivity"), { type, id, label, at: new Date().toISOString() });
+}
+
+function markCreatorViewed(creatorId, user = null) {
   const settings = getSettings();
   let viewed = [];
   try {
-    viewed = JSON.parse(settings.viewedCreators || "[]");
+    viewed = JSON.parse(settings[userSettingKey(user, "viewedCreators")] || settings.viewedCreators || "[]");
   } catch {
     viewed = [];
   }
   viewed = [Number(creatorId), ...viewed.filter((id) => Number(id) !== Number(creatorId))].slice(0, 50);
-  setSetting("viewedCreators", viewed);
+  setSetting(userSettingKey(user, "viewedCreators"), viewed);
 }
 
 function readJson(request) {
   return new Promise((resolve, reject) => {
+    const contentType = String(request.headers["content-type"] || "");
+    if (!contentType.includes("application/json")) {
+      const error = new Error("Expected application/json request body.");
+      error.status = 415;
+      reject(error);
+      return;
+    }
     let body = "";
     request.on("data", (chunk) => {
       body += chunk;
-      if (body.length > 20_000_000) {
+      if (Buffer.byteLength(body) > maxJsonBytes) {
         request.destroy();
-        reject(new Error("Request body is too large."));
+        const error = new Error("Request body is too large.");
+        error.status = 413;
+        reject(error);
       }
     });
     request.on("end", () => {
@@ -208,10 +483,11 @@ function readJson(request) {
   });
 }
 
-function json(response, status, payload) {
+function json(response, status, payload, headers = {}) {
   response.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": "no-cache"
+    "Cache-Control": "no-cache",
+    ...headers
   });
   response.end(JSON.stringify(payload));
 }
@@ -222,6 +498,58 @@ function notFound(response) {
 
 function sanitizeText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function clientKey(request, scope) {
+  const forwarded = String(request.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  const ip = isHosted && forwarded ? forwarded : (request.socket.remoteAddress || "local");
+  return `${scope}:${ip}`;
+}
+
+function checkRateLimit(request, scope) {
+  const now = Date.now();
+
+  // Best-effort pruning to avoid unbounded growth.
+  if (authAttempts.size > 1000) {
+    for (const [key, entry] of authAttempts) {
+      if (entry.resetAt <= now) authAttempts.delete(key);
+    }
+  }
+
+  const key = clientKey(request, scope);
+  const current = authAttempts.get(key) || { count: 0, resetAt: now + authLimitWindowMs };
+  if (current.resetAt <= now) {
+    current.count = 0;
+    current.resetAt = now + authLimitWindowMs;
+  }
+  current.count += 1;
+  authAttempts.set(key, current);
+  if (current.count > authLimitMax) {
+    const error = new Error("Too many attempts. Please try again later.");
+    error.status = 429;
+    throw error;
+  }
+}
+
+function assertSafeMutationOrigin(request) {
+  const method = request.method || "GET";
+  if (!["POST", "PUT", "PATCH", "DELETE"].includes(method)) return;
+  const origin = request.headers.origin;
+  if (!origin) return;
+  const requestHost = String(request.headers.host || "").toLowerCase();
+  try {
+    const originHost = new URL(origin).host.toLowerCase();
+    if (originHost !== requestHost) {
+      const error = new Error("Request origin is not allowed.");
+      error.status = 403;
+      throw error;
+    }
+  } catch (error) {
+    if (error.status) throw error;
+    const blocked = new Error("Request origin is not allowed.");
+    blocked.status = 403;
+    throw blocked;
+  }
 }
 
 function uploadExtension(name, type, dataUrl) {
@@ -275,9 +603,9 @@ function videosFromLines(value) {
     .filter((item) => item.url);
 }
 
-function saveKeyValues(values) {
+function saveKeyValues(values, user = null) {
   for (const [key, value] of Object.entries(values)) {
-    setSetting(key, String(value ?? ""));
+    setSetting(userSettingKey(user, key), String(value ?? ""));
   }
 }
 
@@ -286,7 +614,7 @@ function rowIdFromUrl(url, prefix) {
   return match ? { id: Number(match[1]), rest: match[2] || "" } : null;
 }
 
-function creatorWithRelations(row) {
+function creatorWithRelations(row, user = null) {
   if (!row) return null;
   return {
     ...row,
@@ -305,12 +633,35 @@ function creatorWithRelations(row) {
       WHERE creator_id = ?
       ORDER BY created_at DESC, id DESC
     `, [row.id]),
-    saved: Boolean(get("SELECT creator_id FROM saved_creators WHERE creator_id = ?", [row.id]))
+    saved: Boolean(user ? get("SELECT creator_id FROM saved_creators WHERE user_id = ? AND creator_id = ?", [user.id, row.id]) : null),
+    ownedByCurrentUser: Boolean(user && row.user_id === user.id)
   };
 }
 
-function getState() {
-  const creators = all("SELECT * FROM creators ORDER BY created_at DESC, id DESC").map(creatorWithRelations);
+function getUserSettings(user) {
+  const settings = getSettings();
+  if (!user?.id) return settings;
+
+  const scopedPrefix = `user:${user.id}:`;
+  const scoped = {};
+  const global = {};
+
+  for (const [key, value] of Object.entries(settings)) {
+    if (key.startsWith(scopedPrefix)) scoped[key.slice(scopedPrefix.length)] = value;
+    else if (!key.startsWith("user:")) global[key] = value;
+  }
+
+  return { ...global, ...scoped };
+}
+
+function profileComplete(creator) {
+  if (!creator) return false;
+  return Boolean(creator.name && creator.handle && creator.role && creator.category && creator.description);
+}
+
+function getState(user) {
+  const creators = all("SELECT * FROM creators ORDER BY created_at DESC, id DESC").map((row) => creatorWithRelations(row, user));
+  const myCreator = user ? get("SELECT * FROM creators WHERE user_id = ? ORDER BY id LIMIT 1", [user.id]) : null;
   const circles = all(`
     SELECT c.*, COUNT(m.creator_id) AS members
     FROM creator_circles c
@@ -328,26 +679,36 @@ function getState() {
     SELECT cr.*, c.name AS creator_name
     FROM collaboration_requests cr
     LEFT JOIN creators c ON c.id = cr.creator_id
+    WHERE (? = 1 OR cr.requester_user_id = ? OR cr.creator_id = ?)
     ORDER BY cr.created_at DESC, cr.id DESC
-  `);
+  `, [user?.is_admin ? 1 : 0, user?.id || 0, myCreator?.id || 0]);
   const messages = all(`
     SELECT m.*, c.name AS creator_name
     FROM messages m
     LEFT JOIN creators c ON c.id = m.creator_id
+    WHERE (? = 1 OR m.sender_user_id = ? OR m.recipient_user_id = ? OR m.creator_id = ?)
     ORDER BY m.created_at DESC, m.id DESC
-  `);
-  const activity = all("SELECT * FROM contribution_activity ORDER BY created_at DESC, id DESC LIMIT 20");
+  `, [user?.is_admin ? 1 : 0, user?.id || 0, user?.id || 0, myCreator?.id || 0]);
+  const activity = all(`
+    SELECT * FROM contribution_activity
+    WHERE (? = 1 OR user_id = ? OR user_id IS NULL)
+    ORDER BY created_at DESC, id DESC LIMIT 20
+  `, [user?.is_admin ? 1 : 0, user?.id || 0]);
   const profile = get("SELECT * FROM founder_profile WHERE id = 1") || null;
-  const savedCount = get("SELECT COUNT(*) AS count FROM saved_creators").count;
-  const activeCollaborations = get("SELECT COUNT(*) AS count FROM collaboration_requests WHERE status != 'Completed'").count;
-  const contributionPoints = get("SELECT COALESCE(SUM(points), 0) AS count FROM contribution_activity").count;
-  const circleCreators = get("SELECT COUNT(DISTINCT creator_id) AS count FROM circle_membership").count;
-  const settings = getSettings();
-  const admin = {
+  const savedCount = user ? get("SELECT COUNT(*) AS count FROM saved_creators WHERE user_id = ?", [user.id]).count : 0;
+  const activeCollaborations = get(`
+    SELECT COUNT(*) AS count FROM collaboration_requests
+    WHERE status != 'Completed' AND (? = 1 OR requester_user_id = ? OR creator_id = ?)
+  `, [user?.is_admin ? 1 : 0, user?.id || 0, myCreator?.id || 0]).count;
+  const contributionPoints = get("SELECT COALESCE(SUM(points), 0) AS count FROM contribution_activity WHERE (? = 1 OR user_id = ?)", [user?.is_admin ? 1 : 0, user?.id || 0]).count;
+  const circleCreators = myCreator ? get("SELECT COUNT(DISTINCT creator_id) AS count FROM circle_membership WHERE creator_id = ?", [myCreator.id]).count : 0;
+  const settings = getUserSettings(user);
+  const admin = user?.is_admin ? {
     users: {
       founderProfileComplete: Boolean(profile && profile.name),
       creatorProfiles: get("SELECT COUNT(*) AS count FROM creators").count,
-      savedCreators: savedCount
+      savedCreators: get("SELECT COUNT(*) AS count FROM saved_creators").count,
+      registeredUsers: get("SELECT COUNT(*) AS count FROM users").count
     },
     reports: {
       activityEvents: get("SELECT COUNT(*) AS count FROM contribution_activity").count,
@@ -365,14 +726,22 @@ function getState() {
       contributionPoints
     },
     systemHealth: {
-      databasePath: dbPath,
-      creators,
+      dataDirectory: isHosted ? "configured persistent storage" : "local app data",
       status: "OK"
     }
-  };
+  } : null;
 
   return {
-    profile,
+    profile: user?.is_admin ? profile : {
+      id: myCreator?.id || null,
+      name: user?.display_name || "",
+      handle: myCreator?.handle || "",
+      role: myCreator?.role || "",
+      bio: myCreator?.description || "",
+      image: myCreator?.image || "",
+      mission: settings.mission || ""
+    },
+    myCreator: myCreator ? creatorWithRelations(myCreator, user) : null,
     creators,
     circles,
     circleMembership,
@@ -386,15 +755,13 @@ function getState() {
       contributionPoints
     },
     settings,
-    currentUser: {
-      accountType: "founder",
-      isAdmin: true
-    },
+    currentUser: safeUser(user),
     admin
   };
 }
 
-function saveProfile(payload) {
+function saveProfile(payload, user = null) {
+  if (user) requireAdmin(user);
   run(
     `INSERT INTO founder_profile (id, name, handle, role, bio, image, mission)
      VALUES (1, ?, ?, ?, ?, ?, ?)
@@ -415,16 +782,17 @@ function saveProfile(payload) {
     ]
   );
   if (sanitizeText(payload.name)) {
-    run("INSERT INTO contribution_activity (actor, action, points) VALUES (?, ?, ?)", [
+    run("INSERT INTO contribution_activity (actor, action, points, user_id) VALUES (?, ?, ?, ?)", [
       sanitizeText(payload.name),
       "updated the founder profile",
-      5
+      5,
+      user?.id || null
     ]);
-    setRecentActivity("settings", 1, "Founder profile");
+    setRecentActivity("settings", 1, "Founder profile", user);
   }
 }
 
-function saveCreator(payload, id = null) {
+function saveCreator(payload, id = null, user = null, options = {}) {
   const values = [
     sanitizeText(payload.name),
     sanitizeText(payload.handle),
@@ -444,6 +812,15 @@ function saveCreator(payload, id = null) {
 
   let creatorId = id;
   if (creatorId) {
+    const existing = get("SELECT * FROM creators WHERE id = ?", [creatorId]);
+    if (!existing) throw new Error("Creator was not found.");
+    if (!options.admin && user) {
+      if (!existing.user_id || existing.user_id !== user.id) {
+        const error = new Error("You can only edit your own creator profile.");
+        error.status = 403;
+        throw error;
+      }
+    }
     run(
       `UPDATE creators
        SET name = ?, handle = ?, role = ?, category = ?, description = ?, image = ?, banner = ?,
@@ -457,9 +834,9 @@ function saveCreator(payload, id = null) {
   } else {
     const result = run(
       `INSERT INTO creators
-       (name, handle, role, category, description, image, banner, skills, location, portfolio, collaboration_interests, looking_for)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      values
+       (name, handle, role, category, description, image, banner, skills, location, portfolio, collaboration_interests, looking_for, user_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [...values, user?.id || null]
     );
     creatorId = Number(result.lastInsertRowid);
   }
@@ -471,16 +848,16 @@ function saveCreator(payload, id = null) {
     run("INSERT INTO featured_videos (creator_id, title, url) VALUES (?, ?, ?)", [creatorId, item.title, item.url]);
   }
 
-  run("INSERT INTO contribution_activity (actor, action, points) VALUES (?, ?, ?)", [values[0], id ? "updated a creator profile" : "joined the creator directory", id ? 3 : 10]);
-  setRecentActivity("creator", creatorId, values[0]);
+  run("INSERT INTO contribution_activity (actor, action, points, user_id) VALUES (?, ?, ?, ?)", [values[0], id ? "updated a creator profile" : "joined the creator directory", id ? 3 : 10, user?.id || null]);
+  setRecentActivity("creator", creatorId, values[0], user);
   return creatorId;
 }
 
-function saveMyProfile(payload) {
+function saveMyProfile(payload, user) {
   const name = sanitizeText(payload.name);
   if (!name) throw new Error("Creator name is required.");
 
-  saveProfile({
+  if (user?.is_admin) saveProfile({
     name,
     handle: sanitizeText(payload.handle),
     role: sanitizeText(payload.role) || "Founder",
@@ -489,6 +866,7 @@ function saveMyProfile(payload) {
     mission: sanitizeText(payload.mission)
   });
 
+  run("UPDATE users SET display_name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [name, user.id]);
   saveKeyValues({
     banner: sanitizeText(payload.banner),
     category: sanitizeText(payload.category),
@@ -501,10 +879,10 @@ function saveMyProfile(payload) {
     categories: sanitizeText(payload.category),
     interests: sanitizeText(payload.collaborationInterests),
     collaborationNeeds: sanitizeText(payload.lookingFor)
-  });
+  }, user);
 
-  const settings = getSettings();
-  const existingId = Number(settings.myCreatorId || 0);
+  const existing = get("SELECT id FROM creators WHERE user_id = ? ORDER BY id LIMIT 1", [user.id]);
+  const existingId = Number(existing?.id || 0);
   const creatorPayload = {
     name,
     handle: sanitizeText(payload.handle),
@@ -521,27 +899,116 @@ function saveMyProfile(payload) {
     platforms: listFromLines(payload.platforms),
     videos: videosFromLines(payload.videos)
   };
-  const creatorId = saveCreator(creatorPayload, existingId || null);
-  setSetting("myCreatorId", String(creatorId));
-  setRecentActivity("profile", creatorId, name);
+  const creatorId = saveCreator(creatorPayload, existingId || null, user);
+  setRecentActivity("profile", creatorId, name, user);
 }
 
-function saveCircle(payload) {
+function saveCircle(payload, user) {
   const name = sanitizeText(payload.name);
   if (!name) throw new Error("Circle name is required.");
-  const result = run("INSERT INTO creator_circles (name, detail, accent) VALUES (?, ?, ?)", [
+  const result = run("INSERT INTO creator_circles (name, detail, accent, owner_user_id) VALUES (?, ?, ?, ?)", [
     name,
     sanitizeText(payload.detail),
-    sanitizeText(payload.accent) || "violet"
+    sanitizeText(payload.accent) || "violet",
+    user?.id || null
   ]);
-  run("INSERT INTO contribution_activity (actor, action, points) VALUES (?, ?, ?)", [name, "circle created", 8]);
-  setRecentActivity("circle", Number(result.lastInsertRowid), name);
+  run("INSERT INTO contribution_activity (actor, action, points, user_id) VALUES (?, ?, ?, ?)", [name, "circle created", 8, user?.id || null]);
+  setRecentActivity("circle", Number(result.lastInsertRowid), name, user);
   return Number(result.lastInsertRowid);
+}
+
+async function handleAuth(request, response, url) {
+  if (request.method === "GET" && url.pathname === "/api/auth/me") {
+    return json(response, 200, { user: safeUser(currentUserFromRequest(request)) });
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/auth/register") {
+    assertSafeMutationOrigin(request);
+    checkRateLimit(request, "register");
+    const payload = await readJson(request);
+    const email = normalizeEmail(payload.email);
+    const password = String(payload.password || "");
+    const displayName = sanitizeText(payload.displayName);
+    if (!isValidEmail(email)) throw new Error("Enter a valid email address.");
+    if (!displayName) throw new Error("Display name is required.");
+    if (password.length < 10) throw new Error("Password must be at least 10 characters.");
+    if (get("SELECT id FROM users WHERE email = ?", [email])) {
+      const error = new Error("An account with that email already exists.");
+      error.status = 409;
+      throw error;
+    }
+    const result = run(
+      "INSERT INTO users (email, password_hash, display_name, account_type, is_admin) VALUES (?, ?, ?, 'creator', 0)",
+      [email, hashPassword(password), displayName]
+    );
+    const userId = Number(result.lastInsertRowid);
+    run("UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?", [userId]);
+    createSession(response, request, userId);
+    return json(response, 200, { user: safeUser(get("SELECT * FROM users WHERE id = ?", [userId])) });
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/auth/login") {
+    assertSafeMutationOrigin(request);
+    checkRateLimit(request, "login");
+    const payload = await readJson(request);
+    const email = normalizeEmail(payload.email);
+    const password = String(payload.password || "");
+    const user = get("SELECT * FROM users WHERE email = ?", [email]);
+    if (!user || user.status !== "active" || !verifyPassword(password, user.password_hash)) {
+      const error = new Error("Invalid email or password.");
+      error.status = 401;
+      throw error;
+    }
+    run("UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?", [user.id]);
+    createSession(response, request, user.id);
+    return json(response, 200, { user: safeUser(user) });
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/auth/logout") {
+    assertSafeMutationOrigin(request);
+    const token = parseCookies(request)[sessionCookieName];
+    if (token) run("DELETE FROM sessions WHERE token_hash = ?", [tokenHash(token)]);
+    return json(response, 200, { ok: true }, { "Set-Cookie": clearSessionCookie() });
+  }
+
+  return null;
+}
+
+async function updateAccount(payload, user) {
+  const displayName = sanitizeText(payload.displayName);
+  const email = normalizeEmail(payload.email);
+  if (!displayName) throw new Error("Display name is required.");
+  if (!isValidEmail(email)) throw new Error("Enter a valid email address.");
+  const duplicate = get("SELECT id FROM users WHERE email = ? AND id != ?", [email, user.id]);
+  if (duplicate) {
+    const error = new Error("That email address is already in use.");
+    error.status = 409;
+    throw error;
+  }
+  run("UPDATE users SET email = ?, display_name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [email, displayName, user.id]);
+  const currentPassword = String(payload.currentPassword || "");
+  const newPassword = String(payload.newPassword || "");
+  if (newPassword || currentPassword) {
+    const current = get("SELECT password_hash FROM users WHERE id = ?", [user.id]);
+    if (!verifyPassword(currentPassword, current.password_hash)) {
+      const error = new Error("Current password is incorrect.");
+      error.status = 403;
+      throw error;
+    }
+    if (newPassword.length < 10) throw new Error("New password must be at least 10 characters.");
+    run("UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [hashPassword(newPassword), user.id]);
+  }
 }
 
 async function handleApi(request, response, url) {
   try {
-    if (request.method === "GET" && url.pathname === "/api/state") return json(response, 200, getState());
+    const authResult = await handleAuth(request, response, url);
+    if (authResult !== null) return authResult;
+
+    if (["POST", "PUT", "PATCH", "DELETE"].includes(request.method || "GET")) assertSafeMutationOrigin(request);
+    const user = requireUser(request);
+
+    if (request.method === "GET" && url.pathname === "/api/state") return json(response, 200, getState(user));
 
     if (request.method === "POST" && url.pathname === "/api/uploads") {
       const storedPath = saveUploadedImage(await readJson(request));
@@ -549,33 +1016,34 @@ async function handleApi(request, response, url) {
     }
 
     if (request.method === "POST" && url.pathname === "/api/profile") {
-      saveProfile(await readJson(request));
-      return json(response, 200, getState());
+      saveProfile(await readJson(request), user);
+      return json(response, 200, getState(user));
     }
 
     if (request.method === "POST" && url.pathname === "/api/my-profile") {
-      saveMyProfile(await readJson(request));
-      return json(response, 200, getState());
+      saveMyProfile(await readJson(request), user);
+      return json(response, 200, getState(user));
     }
 
     if (request.method === "POST" && url.pathname === "/api/creators") {
-      saveCreator(await readJson(request));
-      return json(response, 200, getState());
+      saveCreator(await readJson(request), null, user);
+      return json(response, 200, getState(user));
     }
 
     const creatorRoute = rowIdFromUrl(url, "creators");
     if (creatorRoute && request.method === "PUT") {
-      saveCreator(await readJson(request), creatorRoute.id);
-      return json(response, 200, getState());
+      saveCreator(await readJson(request), creatorRoute.id, user, { admin: Boolean(user.is_admin) });
+      return json(response, 200, getState(user));
     }
     if (creatorRoute && request.method === "DELETE") {
+      requireAdmin(user);
       run("DELETE FROM creators WHERE id = ?", [creatorRoute.id]);
-      return json(response, 200, getState());
+      return json(response, 200, getState(user));
     }
 
     if (request.method === "POST" && url.pathname === "/api/circles") {
-      saveCircle(await readJson(request));
-      return json(response, 200, getState());
+      saveCircle(await readJson(request), user);
+      return json(response, 200, getState(user));
     }
 
     const circleRoute = rowIdFromUrl(url, "circles");
@@ -586,25 +1054,25 @@ async function handleApi(request, response, url) {
       run("INSERT OR IGNORE INTO circle_membership (circle_id, creator_id) VALUES (?, ?)", [circleRoute.id, creatorId]);
       const circle = get("SELECT name FROM creator_circles WHERE id = ?", [circleRoute.id]);
       const creator = get("SELECT name FROM creators WHERE id = ?", [creatorId]);
-      if (circle && creator) run("INSERT INTO contribution_activity (actor, action, points) VALUES (?, ?, ?)", [creator.name, `joined ${circle.name}`, 5]);
-      if (circle) setRecentActivity("circle", circleRoute.id, circle.name);
-      return json(response, 200, getState());
+      if (circle && creator) run("INSERT INTO contribution_activity (actor, action, points, user_id) VALUES (?, ?, ?, ?)", [creator.name, `joined ${circle.name}`, 5, user.id]);
+      if (circle) setRecentActivity("circle", circleRoute.id, circle.name, user);
+      return json(response, 200, getState(user));
     }
 
     if (request.method === "POST" && url.pathname === "/api/saved") {
       const payload = await readJson(request);
       const creatorId = Number(payload.creatorId);
       if (!creatorId) throw new Error("Creator is required.");
-      const existing = get("SELECT creator_id FROM saved_creators WHERE creator_id = ?", [creatorId]);
-      if (existing) run("DELETE FROM saved_creators WHERE creator_id = ?", [creatorId]);
+      const existing = get("SELECT creator_id FROM saved_creators WHERE user_id = ? AND creator_id = ?", [user.id, creatorId]);
+      if (existing) run("DELETE FROM saved_creators WHERE user_id = ? AND creator_id = ?", [user.id, creatorId]);
       else {
-        run("INSERT INTO saved_creators (creator_id) VALUES (?)", [creatorId]);
+        run("INSERT INTO saved_creators (user_id, creator_id) VALUES (?, ?)", [user.id, creatorId]);
         const creator = get("SELECT name FROM creators WHERE id = ?", [creatorId]);
-        if (creator) run("INSERT INTO contribution_activity (actor, action, points) VALUES (?, ?, ?)", [creator.name, "saved for follow-up", 2]);
+        if (creator) run("INSERT INTO contribution_activity (actor, action, points, user_id) VALUES (?, ?, ?, ?)", [creator.name, "saved for follow-up", 2, user.id]);
       }
       const creator = get("SELECT name FROM creators WHERE id = ?", [creatorId]);
-      if (creator) setRecentActivity("creator", creatorId, creator.name);
-      return json(response, 200, getState());
+      if (creator) setRecentActivity("creator", creatorId, creator.name, user);
+      return json(response, 200, getState(user));
     }
 
     if (request.method === "POST" && url.pathname === "/api/viewed") {
@@ -613,10 +1081,10 @@ async function handleApi(request, response, url) {
       if (!creatorId) throw new Error("Creator is required.");
       const creator = get("SELECT name FROM creators WHERE id = ?", [creatorId]);
       if (creator) {
-        markCreatorViewed(creatorId);
-        setRecentActivity("creator", creatorId, creator.name);
+        markCreatorViewed(creatorId, user);
+        setRecentActivity("creator", creatorId, creator.name, user);
       }
-      return json(response, 200, getState());
+      return json(response, 200, getState(user));
     }
 
     if (request.method === "POST" && url.pathname === "/api/support") {
@@ -625,15 +1093,16 @@ async function handleApi(request, response, url) {
       if (!creatorId) throw new Error("Creator is required.");
       const creator = get("SELECT name FROM creators WHERE id = ?", [creatorId]);
       if (!creator) throw new Error("Creator was not found.");
-      run("INSERT INTO contribution_activity (actor, action, points) VALUES (?, ?, ?)", [creator.name, "received creator support", 5]);
-      run("INSERT INTO messages (creator_id, subject, body, direction) VALUES (?, ?, ?, ?)", [
+      run("INSERT INTO contribution_activity (actor, action, points, user_id) VALUES (?, ?, ?, ?)", [creator.name, "received creator support", 5, user.id]);
+      run("INSERT INTO messages (creator_id, sender_user_id, subject, body, direction) VALUES (?, ?, ?, ?, ?)", [
         creatorId,
+        user.id,
         "Creator support",
         "Support noted locally from the CAP homepage.",
         "sent"
       ]);
-      setRecentActivity("creator", creatorId, creator.name);
-      return json(response, 200, getState());
+      setRecentActivity("creator", creatorId, creator.name, user);
+      return json(response, 200, getState(user));
     }
 
     if (request.method === "POST" && url.pathname === "/api/collaborations") {
@@ -641,51 +1110,65 @@ async function handleApi(request, response, url) {
       const title = sanitizeText(payload.title);
       if (!title) throw new Error("Collaboration title is required.");
       const creatorId = payload.creatorId ? Number(payload.creatorId) : null;
-      run("INSERT INTO collaboration_requests (creator_id, title, message, status, progress) VALUES (?, ?, ?, ?, ?)", [
+      run("INSERT INTO collaboration_requests (creator_id, requester_user_id, title, message, status, progress) VALUES (?, ?, ?, ?, ?, ?)", [
         creatorId,
+        user.id,
         title,
         sanitizeText(payload.message),
         sanitizeText(payload.status) || "Requested",
         Math.max(0, Math.min(100, Number(payload.progress) || 0))
       ]);
-      run("INSERT INTO contribution_activity (actor, action, points) VALUES (?, ?, ?)", [title, "collaboration request created", 12]);
+      run("INSERT INTO contribution_activity (actor, action, points, user_id) VALUES (?, ?, ?, ?)", [title, "collaboration request created", 12, user.id]);
       const row = get("SELECT id FROM collaboration_requests ORDER BY id DESC LIMIT 1");
-      setRecentActivity("collaboration", row.id, title);
-      return json(response, 200, getState());
+      setRecentActivity("collaboration", row.id, title, user);
+      return json(response, 200, getState(user));
     }
 
     if (request.method === "POST" && url.pathname === "/api/messages") {
       const payload = await readJson(request);
       const body = sanitizeText(payload.body);
       if (!body) throw new Error("Message body is required.");
-      run("INSERT INTO messages (creator_id, subject, body, direction) VALUES (?, ?, ?, ?)", [
+      run("INSERT INTO messages (creator_id, sender_user_id, subject, body, direction) VALUES (?, ?, ?, ?, ?)", [
         payload.creatorId ? Number(payload.creatorId) : null,
+        user.id,
         sanitizeText(payload.subject),
         body,
         sanitizeText(payload.direction) || "sent"
       ]);
-      run("INSERT INTO contribution_activity (actor, action, points) VALUES (?, ?, ?)", [sanitizeText(payload.subject) || "Message", "local message sent", 2]);
+      run("INSERT INTO contribution_activity (actor, action, points, user_id) VALUES (?, ?, ?, ?)", [sanitizeText(payload.subject) || "Message", "local message sent", 2, user.id]);
       const row = get("SELECT id FROM messages ORDER BY id DESC LIMIT 1");
-      setRecentActivity("message", row.id, sanitizeText(payload.subject) || "Message");
-      return json(response, 200, getState());
+      setRecentActivity("message", row.id, sanitizeText(payload.subject) || "Message", user);
+      return json(response, 200, getState(user));
     }
 
     if (request.method === "POST" && url.pathname === "/api/settings") {
       const payload = await readJson(request);
       for (const [key, value] of Object.entries(payload)) {
         run("INSERT INTO application_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [
-          sanitizeText(key),
+          userSettingKey(user, sanitizeText(key)),
           String(value ?? "")
         ]);
       }
-      setRecentActivity("settings", 1, "Application settings");
-      return json(response, 200, getState());
+      setRecentActivity("settings", 1, "Application settings", user);
+      return json(response, 200, getState(user));
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/account") {
+      await updateAccount(await readJson(request), user);
+      return json(response, 200, { user: safeUser(get("SELECT * FROM users WHERE id = ?", [user.id])) });
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/admin/users") {
+      requireAdmin(user);
+      return json(response, 200, {
+        users: all("SELECT id, email, display_name AS displayName, account_type AS accountType, is_admin AS isAdmin, status, created_at AS createdAt, last_login_at AS lastLoginAt FROM users ORDER BY created_at DESC")
+      });
     }
 
     return notFound(response);
   } catch (error) {
     log(`API error: ${error.stack || error.message}`);
-    return json(response, 400, { error: error.message || "Request failed" });
+    return json(response, error.status || 400, { error: error.message || "Request failed" });
   }
 }
 
@@ -780,10 +1263,7 @@ function startServer(port) {
     if (request.method === "GET" && url.pathname === "/health") {
       return json(response, 200, {
         status: "ok",
-        service: "CAP",
-        database: dbPath,
-        dataDir,
-        uploads: uploadDir
+        service: "CAP"
       });
     }
     if (url.pathname.startsWith("/api/")) {
