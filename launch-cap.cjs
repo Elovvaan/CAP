@@ -619,12 +619,17 @@ function creatorWithRelations(row, user = null) {
 function getUserSettings(user) {
   const settings = getSettings();
   if (!user?.id) return settings;
+
   const scopedPrefix = `user:${user.id}:`;
   const scoped = {};
+  const global = {};
+
   for (const [key, value] of Object.entries(settings)) {
     if (key.startsWith(scopedPrefix)) scoped[key.slice(scopedPrefix.length)] = value;
+    else if (!key.startsWith("user:")) global[key] = value;
   }
-  return { ...settings, ...scoped };
+
+  return { ...global, ...scoped };
 }
 
 function profileComplete(creator) {
