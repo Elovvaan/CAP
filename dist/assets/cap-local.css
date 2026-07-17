@@ -266,3 +266,128 @@ body::before {
 .field select {
   background-color: rgba(7, 16, 29, .76) !important;
 }
+
+/* CAP glass visibility pass: keep city artwork visible behind the live UI. */
+:root,
+html {
+  background: #020816 url("./cap-background.png") center center / cover fixed no-repeat !important;
+}
+body {
+  background: transparent !important;
+}
+body::before {
+  background: rgba(2, 8, 22, .58) !important;
+}
+#root,
+#app,
+.app-shell,
+.page-wrapper,
+.dashboard-wrapper,
+.content-grid,
+.dashboard-grid,
+.homepage-flow,
+.profile-page,
+.directory-only {
+  background: transparent !important;
+}
+.main-content {
+  background: rgba(3, 9, 20, .14) !important;
+}
+.sidebar,
+.topbar,
+.panel,
+.stat-card,
+.record-card,
+.project-card,
+.welcome-group,
+.admin-grid > div,
+.profile-section,
+.activity-panel,
+.circles-panel,
+.discovery-panel,
+.projects-panel,
+.profile-editor-panel,
+.admin-panel,
+.public-profile-page .panel,
+.mission-card,
+.profile-card {
+  background: rgba(7, 15, 29, .70) !important;
+  background-color: rgba(7, 15, 29, .70) !important;
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+  border-color: rgba(160, 180, 220, .16) !important;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, .25);
+}
+.discovery-panel .discovery-media-card {
+  background: rgba(7, 15, 29, .34) !important;
+  background-color: rgba(7, 15, 29, .34) !important;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+.discovery-panel .discovery-media-card .creator-banner,
+.discovery-panel .discovery-media-card .creator-cover-image {
+  opacity: 1 !important;
+  filter: none !important;
+}
+.activity-row,
+.circle-row,
+.record-card .record-card,
+.compact-records .record-card,
+.top-actions .search-box,
+.search-box,
+.field input,
+.field textarea,
+.field select,
+.icon-button,
+.secondary-button,
+.platform-button,
+.watch-button,
+.upload-preview,
+.select-row select,
+.project-icon,
+.stat-icon,
+.category-pill,
+.mini-pill,
+.progress-track,
+.creator-avatar.placeholder,
+.directory-avatar.placeholder {
+  background: rgba(5, 12, 24, .74) !important;
+  background-color: rgba(5, 12, 24, .74) !important;
+}
+.primary-button,
+.nav-item.active {
+  background: linear-gradient(90deg, #7047ef, #3f86f7) !important;
+}
+.nav-item:not(.active):hover {
+  background: rgba(16, 28, 45, .68) !important;
+}
+.panel-header {
+  background: rgba(5, 12, 24, .18);
+  border-bottom-color: rgba(160, 180, 220, .14) !important;
+}
+.sidebar {
+  border-right-color: rgba(160, 180, 220, .16) !important;
+}
+.empty-page {
+  background: rgba(7, 15, 29, .70) !important;
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+}
+.auth-screen {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+}
+.auth-card {
+  width: min(520px, 100%);
+  padding: 22px;
+  display: grid;
+  gap: 16px;
+}
+.auth-brand {
+  padding: 0;
+}
+.auth-form {
+  padding: 0;
+}
