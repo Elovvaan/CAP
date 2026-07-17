@@ -515,7 +515,7 @@ function readJson(request, maxBytes = maxJsonBytes) {
         if (tooLarge) throw uploadError("Request payload is too large.", 413);
         resolve(body ? JSON.parse(body) : {});
       } catch (error) {
-        reject(error.status ? error : uploadError("Malformed JSON payload."));
+        reject(error.status ? error : uploadError("Malformed upload payload."));
       }
     });
     request.on("error", reject);
@@ -541,7 +541,7 @@ function sanitizeText(value) {
 
 function clientKey(request, scope) {
   const forwarded = String(request.headers["x-forwarded-for"] || "").split(",")[0].trim();
-  const ip = trustProxy && forwarded ? forwarded : (request.socket.remoteAddress || "local");
+  const ip = isHosted && forwarded ? forwarded : (request.socket.remoteAddress || "local");
   return `${scope}:${ip}`;
 }
 
