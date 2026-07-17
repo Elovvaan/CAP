@@ -89,6 +89,9 @@ async function upload(cookieValue, payload) {
     assert(health.response.status === 200 && health.body.status === "ok", "health endpoint failed");
     const background = await fetch(`${base}/assets/cap-background.png`);
     assert(background.status === 200, "background asset did not return 200");
+    const clientScript = fs.readFileSync(path.join(projectRoot, "dist", "assets", "cap-local.js"), "utf8");
+    assert(clientScript.includes("function accountLabel"), "Account label helper missing from client");
+    assert(!clientScript.includes('profile?.role || "Founder"'), "Signed-in identity still falls back from creator role to Founder");
 
     const regA = await request("/api/auth/register", {
       method: "POST",
@@ -96,20 +99,23 @@ async function upload(cookieValue, payload) {
     });
     const cookieA = cookie(regA.response);
     assert(regA.response.status === 200 && regA.body.user && !regA.body.user.password_hash, "User A registration failed or leaked password hash");
+    assert(regA.body.user.accountType === "creator" && regA.body.user.isAdmin === false, "User A was not registered as a normal creator account");
 
     const regB = await request("/api/auth/register", {
       method: "POST",
-      body: JSON.stringify({ displayName: "User B", email: "b@example.test", password: "SamePassword123!" })
+      body: JSON.stringify({ displayName: "User B", email: "b@example.test", password: "SamePassword123!", account_type: "founder", accountType: "founder", is_admin: 1, isAdmin: true, status: "active", user_id: 1 })
     });
     const cookieB = cookie(regB.response);
     assert(regB.response.status === 200 && regB.body.user, "User B registration failed");
+    assert(regB.body.user.accountType === "creator" && regB.body.user.isAdmin === false, "Registration payload changed User B account privileges");
 
     const profileA = await request("/api/my-profile", {
       method: "POST",
       headers: { Cookie: cookieA },
-      body: JSON.stringify({ name: "User A Creator", handle: "usera", role: "Filmmaker", category: "Film", bio: "A bio", skills: "editing", location: "Denver" })
+      body: JSON.stringify({ name: "User A Creator", handle: "usera", role: "Founder", category: "Film", bio: "A bio", skills: "editing", location: "Denver" })
     });
     assert(profileA.response.status === 200 && profileA.body.currentUser.creatorProfileId, "User A profile failed");
+    assert(profileA.body.currentUser.accountType === "creator" && profileA.body.currentUser.isAdmin === false, "Changing creator Role changed User A account identity");
 
     const smallPng = await upload(cookieA, { name: "small.png", type: "image/png", data: dataUrl("image/png", 128) });
     assert(smallPng.response.status === 200 && smallPng.body.path, "small PNG upload failed");
@@ -142,9 +148,10 @@ async function upload(cookieValue, payload) {
     const profileB = await request("/api/my-profile", {
       method: "POST",
       headers: { Cookie: cookieB },
-      body: JSON.stringify({ name: "User B Creator", handle: "userb", role: "Designer", category: "Design", bio: "B bio", skills: "branding", location: "Austin" })
+      body: JSON.stringify({ name: "User B Creator", handle: "userb", role: "Founder", category: "Design", bio: "B bio", skills: "branding", location: "Austin" })
     });
     assert(profileB.response.status === 200 && profileB.body.currentUser.creatorProfileId, "User B profile failed");
+    assert(profileB.body.currentUser.accountType === "creator" && profileB.body.currentUser.isAdmin === false, "Changing creator Role changed User B account identity");
 
     const crossEdit = await request(`/api/creators/${profileA.body.currentUser.creatorProfileId}`, {
       method: "PUT",
@@ -161,8 +168,16 @@ async function upload(cookieValue, payload) {
       body: JSON.stringify({ email: "founder@example.test", password: "FounderPassword123!" })
     });
     const founderCookie = cookie(founderLogin.response);
+    assert(founderLogin.body.user.accountType === "founder" && founderLogin.body.user.isAdmin === true, "Founder account did not display founder account metadata");
     const adminAllowed = await request("/api/admin/users", { headers: { Cookie: founderCookie } });
     assert(adminAllowed.response.status === 200 && Array.isArray(adminAllowed.body.users), "Founder could not reach admin endpoint");
+
+    const dbForAdminPromotion = new DatabaseSync(path.join(dir, "cap.db"));
+    dbForAdminPromotion.prepare("UPDATE users SET is_admin = 1, account_type = 'creator' WHERE email = ?").run("b@example.test");
+    dbForAdminPromotion.close();
+    const promotedState = await request("/api/state", { headers: { Cookie: cookieB } });
+    assert(promotedState.response.status === 200, "Promoted admin state failed");
+    assert(promotedState.body.currentUser.accountType === "creator" && promotedState.body.currentUser.isAdmin === true, "Promoted admin should be Admin-capable but not Founder");
 
     const logout = await request("/api/auth/logout", {
       method: "POST",
