@@ -804,10 +804,12 @@ function saveCreator(payload, id = null, user = null, options = {}) {
   if (creatorId) {
     const existing = get("SELECT * FROM creators WHERE id = ?", [creatorId]);
     if (!existing) throw new Error("Creator was not found.");
-    if (!options.admin && user && existing.user_id && existing.user_id !== user.id) {
-      const error = new Error("You can only edit your own creator profile.");
-      error.status = 403;
-      throw error;
+    if (!options.admin && user) {
+      if (!existing.user_id || existing.user_id !== user.id) {
+        const error = new Error("You can only edit your own creator profile.");
+        error.status = 403;
+        throw error;
+      }
     }
     run(
       `UPDATE creators
