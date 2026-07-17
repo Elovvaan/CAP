@@ -10,8 +10,7 @@ ENV npm_config_audit=false \
 
 # Railway only needs the browser application. Install the exact web/build
 # packages directly so the Linux image does not download the Tauri desktop CLI.
-RUN --mount=type=cache,target=/root/.npm \
-    npm install --no-save --ignore-scripts --no-audit --no-fund \
+RUN npm install --no-save --ignore-scripts --no-audit --no-fund \
       react@18.3.1 \
       react-dom@18.3.1 \
       lucide-react@0.468.0 \
