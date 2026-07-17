@@ -301,10 +301,22 @@ function tokenHash(token) {
 }
 
 function parseCookies(request) {
-  return Object.fromEntries(String(request.headers.cookie || "").split(";").map((part) => {
-    const [key, ...rest] = part.trim().split("=");
-    return [key, decodeURIComponent(rest.join("=") || "")];
-  }).filter(([key]) => key));
+  return Object.fromEntries(
+    String(request.headers.cookie || "")
+      .split(";")
+      .map((part) => {
+        const [key, ...rest] = part.trim().split("=");
+        const raw = rest.join("=") || "";
+        let value = raw;
+        try {
+          value = decodeURIComponent(raw);
+        } catch {
+          value = raw;
+        }
+        return [key, value];
+      })
+      .filter(([key]) => key)
+  );
 }
 
 function cookieHeader(name, value, options = {}) {
