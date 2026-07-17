@@ -501,12 +501,22 @@ function sanitizeText(value) {
 }
 
 function clientKey(request, scope) {
-  return `${scope}:${request.socket.remoteAddress || "local"}`;
+  const forwarded = String(request.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  const ip = isHosted && forwarded ? forwarded : (request.socket.remoteAddress || "local");
+  return `${scope}:${ip}`;
 }
 
 function checkRateLimit(request, scope) {
-  const key = clientKey(request, scope);
   const now = Date.now();
+
+  // Best-effort pruning to avoid unbounded growth.
+  if (authAttempts.size > 1000) {
+    for (const [key, entry] of authAttempts) {
+      if (entry.resetAt <= now) authAttempts.delete(key);
+    }
+  }
+
+  const key = clientKey(request, scope);
   const current = authAttempts.get(key) || { count: 0, resetAt: now + authLimitWindowMs };
   if (current.resetAt <= now) {
     current.count = 0;
