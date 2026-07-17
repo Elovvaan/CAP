@@ -202,3 +202,67 @@
   box-shadow: 0 2px 10px rgba(0,0,0,.26);
   backdrop-filter: none;
 }
+/* CAP global cinematic background. */
+html {
+  min-height: 100%;
+  background: #020816 url("./cap-background.png") center center / cover fixed no-repeat;
+}
+body {
+  min-height: 100%;
+  background: transparent !important;
+}
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: rgba(2, 8, 22, .82);
+}
+#root,
+.app-shell {
+  background: transparent !important;
+}
+.main-content {
+  background: rgba(5, 12, 24, .54) !important;
+}
+.sidebar {
+  background: rgba(4, 11, 22, .76) !important;
+  backdrop-filter: blur(8px);
+}
+.stat-card,
+.panel,
+.record-card,
+.activity-row,
+.circle-row,
+.project-card,
+.welcome-group,
+.admin-grid > div,
+.profile-section,
+.discovery-panel,
+.discovery-panel .discovery-media-card,
+.mission-card,
+.profile-card {
+  background-color: rgba(8, 19, 33, .78) !important;
+}
+.panel,
+.stat-card,
+.record-card,
+.activity-row,
+.circle-row,
+.project-card,
+.welcome-group,
+.admin-grid > div,
+.profile-section,
+.discovery-panel .discovery-media-card,
+.mission-card,
+.profile-card {
+  border-color: rgba(77, 100, 132, .48) !important;
+}
+.topbar,
+.top-actions .search-box,
+.field input,
+.field textarea,
+.field select {
+  background-color: rgba(7, 16, 29, .76) !important;
+}
