@@ -1,13 +1,23 @@
+# syntax=docker/dockerfile:1.7
+
 FROM node:24-bookworm-slim AS build
 
 WORKDIR /app
 
+ENV npm_config_audit=false \
+    npm_config_fund=false \
+    npm_config_update_notifier=false
+
 COPY package.json package-lock.json ./
-RUN npm ci
+
+# CAP's web build needs TypeScript and Vite, but it does not need desktop/Tauri
+# install scripts during Railway's Linux build. Cache npm downloads between builds.
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --ignore-scripts --no-audit --no-fund
 
 COPY . .
 RUN npm run build
-RUN npm prune --omit=dev
+RUN npm prune --omit=dev --ignore-scripts --no-audit --no-fund
 
 FROM node:24-bookworm-slim AS runtime
 
