@@ -8,25 +8,29 @@ ENV npm_config_audit=false \
     npm_config_fund=false \
     npm_config_update_notifier=false
 
-COPY package.json package-lock.json ./
-
-# CAP's web build needs TypeScript and Vite, but it does not need desktop/Tauri
-# install scripts during Railway's Linux build. Cache npm downloads between builds.
+# Railway only needs the browser application. Install the exact web/build
+# packages directly so the Linux image does not download the Tauri desktop CLI.
 RUN --mount=type=cache,target=/root/.npm \
-    npm ci --ignore-scripts --no-audit --no-fund
+    npm install --no-save --ignore-scripts --no-audit --no-fund \
+      react@18.3.1 \
+      react-dom@18.3.1 \
+      lucide-react@0.468.0 \
+      typescript@5.7.2 \
+      vite@6.0.3 \
+      @vitejs/plugin-react@4.3.4 \
+      @types/react@18.3.12 \
+      @types/react-dom@18.3.1
 
 COPY . .
-RUN npm run build
-RUN npm prune --omit=dev --ignore-scripts --no-audit --no-fund
+RUN ./node_modules/.bin/tsc && ./node_modules/.bin/vite build
 
 FROM node:24-bookworm-slim AS runtime
 
-ENV NODE_ENV=production
+ENV NODE_ENV=production \
+    CAP_NO_OPEN=1
+
 WORKDIR /app
 
-COPY --from=build /app/package.json ./package.json
-COPY --from=build /app/package-lock.json ./package-lock.json
-COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/launch-cap.cjs ./launch-cap.cjs
 
