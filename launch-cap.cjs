@@ -7,6 +7,7 @@ const { DatabaseSync } = require("node:sqlite");
 
 const root = path.join(__dirname, "dist");
 const isHosted = Boolean(process.env.PORT || process.env.RAILWAY_ENVIRONMENT || process.env.CAP_HOST);
+const trustProxy = Boolean(process.env.CAP_TRUST_PROXY);
 const dataDir = path.resolve(process.env.CAP_DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, "data"));
 const uploadDir = path.join(dataDir, "uploads");
 const dbPath = process.env.CAP_DB_PATH ? path.resolve(process.env.CAP_DB_PATH) : path.join(dataDir, "cap.db");
@@ -21,6 +22,7 @@ const maxDecodedImageBytes = 15 * 1024 * 1024;
 const authLimitWindowMs = 15 * 60 * 1000;
 const authLimitMax = 20;
 const authAttempts = new Map();
+const discoveryCache = new Map();
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -220,6 +222,29 @@ function initializeDatabase() {
       user_agent TEXT NOT NULL DEFAULT '',
       ip_address TEXT NOT NULL DEFAULT ''
     );
+
+    CREATE TABLE IF NOT EXISTS creator_views (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      viewer_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      creator_id INTEGER NOT NULL REFERENCES creators(id) ON DELETE CASCADE,
+      viewed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS creator_hides (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      creator_id INTEGER NOT NULL REFERENCES creators(id) ON DELETE CASCADE,
+      hidden_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, creator_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS creator_follows (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      follower_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      creator_id INTEGER NOT NULL REFERENCES creators(id) ON DELETE CASCADE,
+      followed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(follower_user_id, creator_id)
+    );
   `);
 
   const requiredCreatorColumns = [
@@ -247,6 +272,11 @@ function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_messages_sender_user_id ON messages(sender_user_id);
     CREATE INDEX IF NOT EXISTS idx_messages_recipient_user_id ON messages(recipient_user_id);
     CREATE INDEX IF NOT EXISTS idx_activity_user_id ON contribution_activity(user_id);
+    CREATE INDEX IF NOT EXISTS idx_creator_views_viewer ON creator_views(viewer_user_id, creator_id);
+    CREATE INDEX IF NOT EXISTS idx_creator_views_creator ON creator_views(creator_id, viewed_at);
+    CREATE INDEX IF NOT EXISTS idx_creator_hides_user ON creator_hides(user_id, creator_id);
+    CREATE INDEX IF NOT EXISTS idx_creator_follows_user ON creator_follows(follower_user_id, creator_id);
+    CREATE INDEX IF NOT EXISTS idx_creator_follows_creator ON creator_follows(creator_id);
   `);
   initializeFounderUser();
 }
@@ -638,6 +668,158 @@ function rowIdFromUrl(url, prefix) {
   return match ? { id: Number(match[1]), rest: match[2] || "" } : null;
 }
 
+function splitTerms(value) {
+  return String(value || "")
+    .split(/[\n,|]/)
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function termMatches(a, b) {
+  const left = splitTerms(a);
+  const right = splitTerms(b);
+  return [...new Set(left.filter((term) => right.some((other) => other.includes(term) || term.includes(other))))];
+}
+
+function platformTerms(creator) {
+  if (!creator?.id) return "";
+  return all("SELECT platform, url FROM platform_links WHERE creator_id = ? ORDER BY id", [creator.id])
+    .flatMap((item) => [item.platform, item.url])
+    .join(", ");
+}
+
+function invalidateDiscovery(user = null) {
+  if (user?.id) discoveryCache.delete(user.id);
+  else discoveryCache.clear();
+}
+
+function getDiscoveryQueue(user, force = false) {
+  if (!user?.id) return [];
+  if (!force && discoveryCache.has(user.id)) return discoveryCache.get(user.id);
+
+  const myCreator = get("SELECT * FROM creators WHERE user_id = ? ORDER BY id LIMIT 1", [user.id]);
+  const settings = getUserSettings(user);
+  const myPlatforms = `${platformTerms(myCreator || {})} ${settings.platforms || ""}`;
+  const saved = new Set(all("SELECT creator_id FROM saved_creators WHERE user_id = ?", [user.id]).map((row) => Number(row.creator_id)));
+  const viewed = new Set(all("SELECT creator_id FROM creator_views WHERE viewer_user_id = ?", [user.id]).map((row) => Number(row.creator_id)));
+  const hidden = new Set(all("SELECT creator_id FROM creator_hides WHERE user_id = ?", [user.id]).map((row) => Number(row.creator_id)));
+  const followed = new Set(all("SELECT creator_id FROM creator_follows WHERE follower_user_id = ?", [user.id]).map((row) => Number(row.creator_id)));
+
+  const rows = all(`
+    SELECT c.*
+    FROM creators c
+    LEFT JOIN users u ON u.id = c.user_id
+    WHERE COALESCE(u.status, 'active') = 'active'
+    ORDER BY c.updated_at DESC, c.id DESC
+  `);
+
+  const recommendations = rows
+    .filter((creator) => !(myCreator && creator.id === myCreator.id) && !hidden.has(creator.id))
+    .map((creator) => {
+      const reasons = [];
+      let score = 0;
+      if (viewed.has(creator.id)) score -= 20;
+      if (saved.has(creator.id)) score -= 35;
+
+      if (myCreator?.category && creator.category && myCreator.category.toLowerCase() === creator.category.toLowerCase()) {
+        score += 40;
+        reasons.push("same category");
+      }
+      const skills = termMatches(`${myCreator?.skills || ""},${settings.skills || ""}`, creator.skills);
+      if (skills.length) {
+        score += 30;
+        reasons.push(`skills: ${skills.slice(0, 3).join(", ")}`);
+      }
+      const collabs = termMatches(`${myCreator?.collaboration_interests || ""},${settings.collaborationInterests || ""},${settings.collaborationNeeds || ""}`, `${creator.collaboration_interests} ${creator.looking_for} ${creator.description}`);
+      if (collabs.length) {
+        score += 25;
+        reasons.push(`interests: ${collabs.slice(0, 3).join(", ")}`);
+      }
+      if ((myCreator?.location || settings.location) && creator.location && String(myCreator?.location || settings.location).trim().toLowerCase() === creator.location.trim().toLowerCase()) {
+        score += 20;
+        reasons.push("same location");
+      }
+      if (myCreator?.role && creator.role && myCreator.role.toLowerCase() === creator.role.toLowerCase()) {
+        score += 15;
+        reasons.push("same role");
+      }
+      const platforms = termMatches(myPlatforms, platformTerms(creator));
+      if (platforms.length) {
+        score += 10;
+        reasons.push(`platforms: ${platforms.slice(0, 2).join(", ")}`);
+      }
+
+      return {
+        ...creatorWithRelations(creator, user),
+        score,
+        discoveryScore: score,
+        discoveryReasons: reasons,
+        viewed: viewed.has(creator.id),
+        followed: followed.has(creator.id)
+      };
+    })
+    .sort((a, b) => b.score - a.score || new Date(b.updated_at || b.created_at).getTime() - new Date(a.updated_at || a.created_at).getTime());
+
+  // Avoid unbounded growth if many users hit discovery.
+  if (discoveryCache.size > 5000) discoveryCache.delete(discoveryCache.keys().next().value);
+  discoveryCache.set(user.id, recommendations);
+  return recommendations;
+}
+
+function discoveryHomeWidgets(user) {
+  const queue = getDiscoveryQueue(user);
+  const myCreator = user ? get("SELECT * FROM creators WHERE user_id = ? ORDER BY id LIMIT 1", [user.id]) : null;
+  const hidden = new Set(user ? all("SELECT creator_id FROM creator_hides WHERE user_id = ?", [user.id]).map((row) => Number(row.creator_id)) : []);
+  const visible = (creator) => !(myCreator && Number(creator.id) === Number(myCreator.id)) && !hidden.has(Number(creator.id));
+  const recent = all(`
+    SELECT c.*
+    FROM creators c
+    LEFT JOIN users u ON u.id = c.user_id
+    WHERE COALESCE(u.status, 'active') = 'active'
+    ORDER BY c.created_at DESC, c.id DESC
+    LIMIT 12
+  `).filter(visible).slice(0, 4).map((row) => creatorWithRelations(row, user));
+  return {
+    recommendedCreators: queue.slice(0, 4),
+    peopleNearYourInterests: queue.filter((creator) => (creator.discoveryReasons || []).some((reason) => /skills|interests|platforms/.test(reason))).slice(0, 4),
+    newCreators: recent,
+    recentlyJoined: recent,
+    trendingCreators: all(`
+      SELECT c.*, COUNT(v.id) + COUNT(f.id) * 2 + COUNT(s.id) AS trend_score
+      FROM creators c
+      LEFT JOIN users u ON u.id = c.user_id
+      LEFT JOIN creator_views v ON v.creator_id = c.id
+      LEFT JOIN creator_follows f ON f.creator_id = c.id
+      LEFT JOIN saved_creators s ON s.creator_id = c.id
+      WHERE COALESCE(u.status, 'active') = 'active'
+      GROUP BY c.id
+      ORDER BY trend_score DESC, c.updated_at DESC, c.id DESC
+      LIMIT 12
+    `).filter(visible).slice(0, 4).map((row) => creatorWithRelations(row, user))
+  };
+}
+
+function creatorSocialContext(creator, user) {
+  if (!creator) return {};
+  const myCreator = user ? get("SELECT * FROM creators WHERE user_id = ? ORDER BY id LIMIT 1", [user.id]) : null;
+  const followers = get("SELECT COUNT(*) AS count FROM creator_follows WHERE creator_id = ?", [creator.id]).count;
+  const following = creator.user_id ? get("SELECT COUNT(*) AS count FROM creator_follows WHERE follower_user_id = ?", [creator.user_id]).count : 0;
+  const myCircles = myCreator ? new Set(all("SELECT circle_id FROM circle_membership WHERE creator_id = ?", [myCreator.id]).map((row) => Number(row.circle_id))) : new Set();
+  const theirCircles = all(`
+    SELECT c.id, c.name
+    FROM circle_membership m
+    JOIN creator_circles c ON c.id = m.circle_id
+    WHERE m.creator_id = ?
+  `, [creator.id]);
+  return {
+    followers,
+    following,
+    mutualCircles: theirCircles.filter((circle) => myCircles.has(Number(circle.id))),
+    mutualSkills: termMatches(myCreator?.skills || "", creator.skills),
+    sharedInterests: termMatches(myCreator?.collaboration_interests || "", creator.collaboration_interests)
+  };
+}
+
 function creatorWithRelations(row, user = null) {
   if (!row) return null;
   return {
@@ -658,7 +840,9 @@ function creatorWithRelations(row, user = null) {
       ORDER BY created_at DESC, id DESC
     `, [row.id]),
     saved: Boolean(user ? get("SELECT creator_id FROM saved_creators WHERE user_id = ? AND creator_id = ?", [user.id, row.id]) : null),
-    ownedByCurrentUser: Boolean(user && row.user_id === user.id)
+    followed: Boolean(user ? get("SELECT creator_id FROM creator_follows WHERE follower_user_id = ? AND creator_id = ?", [user.id, row.id]) : null),
+    ownedByCurrentUser: Boolean(user && row.user_id === user.id),
+    social: creatorSocialContext(row, user)
   };
 }
 
@@ -742,7 +926,40 @@ function getState(user) {
     analytics: {
       circles: get("SELECT COUNT(*) AS count FROM creator_circles").count,
       circleMemberships: get("SELECT COUNT(*) AS count FROM circle_membership").count,
-      contributionPoints
+      contributionPoints,
+      mostViewedCreators: all(`
+        SELECT c.id, c.name, COUNT(v.id) AS count
+        FROM creator_views v
+        JOIN creators c ON c.id = v.creator_id
+        GROUP BY c.id
+        ORDER BY count DESC, c.updated_at DESC
+        LIMIT 5
+      `),
+      mostFollowedCreators: all(`
+        SELECT c.id, c.name, COUNT(f.id) AS count
+        FROM creator_follows f
+        JOIN creators c ON c.id = f.creator_id
+        GROUP BY c.id
+        ORDER BY count DESC, c.updated_at DESC
+        LIMIT 5
+      `),
+      mostSavedCreators: all(`
+        SELECT c.id, c.name, COUNT(s.creator_id) AS count
+        FROM saved_creators s
+        JOIN creators c ON c.id = s.creator_id
+        GROUP BY c.id
+        ORDER BY count DESC, c.updated_at DESC
+        LIMIT 5
+      `),
+      fastestGrowingCreators: all(`
+        SELECT c.id, c.name, COUNT(f.id) + COUNT(v.id) AS count
+        FROM creators c
+        LEFT JOIN creator_follows f ON f.creator_id = c.id AND f.followed_at >= datetime('now', '-7 days')
+        LEFT JOIN creator_views v ON v.creator_id = c.id AND v.viewed_at >= datetime('now', '-7 days')
+        GROUP BY c.id
+        ORDER BY count DESC, c.created_at DESC
+        LIMIT 5
+      `)
     },
     systemHealth: {
       dataDirectory: isHosted ? "configured persistent storage" : "local app data",
@@ -762,6 +979,8 @@ function getState(user) {
     },
     myCreator: myCreator ? creatorWithRelations(myCreator, user) : null,
     creators,
+    discovery: getDiscoveryQueue(user),
+    homeRecommendations: discoveryHomeWidgets(user),
     circles,
     circleMembership,
     collaborations,
@@ -920,6 +1139,7 @@ function saveMyProfile(payload, user) {
   };
   const creatorId = saveCreator(creatorPayload, existingId || null, user);
   setRecentActivity("profile", creatorId, name, user);
+  invalidateDiscovery(user);
 }
 
 function saveCircle(payload, user) {
@@ -1029,6 +1249,10 @@ async function handleApi(request, response, url) {
 
     if (request.method === "GET" && url.pathname === "/api/state") return json(response, 200, getState(user));
 
+    if (request.method === "GET" && url.pathname === "/api/discovery") {
+      return json(response, 200, { recommendations: getDiscoveryQueue(user, url.searchParams.get("refresh") === "1") });
+    }
+
     if (request.method === "POST" && url.pathname === "/api/uploads") {
       const storedPath = saveUploadedImage(await readJson(request, maxUploadJsonBytes));
       return json(response, 200, { path: storedPath });
@@ -1041,17 +1265,20 @@ async function handleApi(request, response, url) {
 
     if (request.method === "POST" && url.pathname === "/api/my-profile") {
       saveMyProfile(await readJson(request), user);
+      invalidateDiscovery(user);
       return json(response, 200, getState(user));
     }
 
     if (request.method === "POST" && url.pathname === "/api/creators") {
       saveCreator(await readJson(request), null, user);
+      invalidateDiscovery();
       return json(response, 200, getState(user));
     }
 
     const creatorRoute = rowIdFromUrl(url, "creators");
     if (creatorRoute && request.method === "PUT") {
       saveCreator(await readJson(request), creatorRoute.id, user, { admin: Boolean(user.is_admin) });
+      invalidateDiscovery();
       return json(response, 200, getState(user));
     }
     if (creatorRoute && request.method === "DELETE") {
@@ -1062,6 +1289,7 @@ async function handleApi(request, response, url) {
 
     if (request.method === "POST" && url.pathname === "/api/circles") {
       saveCircle(await readJson(request), user);
+      invalidateDiscovery();
       return json(response, 200, getState(user));
     }
 
@@ -1075,6 +1303,7 @@ async function handleApi(request, response, url) {
       const creator = get("SELECT name FROM creators WHERE id = ?", [creatorId]);
       if (circle && creator) run("INSERT INTO contribution_activity (actor, action, points, user_id) VALUES (?, ?, ?, ?)", [creator.name, `joined ${circle.name}`, 5, user.id]);
       if (circle) setRecentActivity("circle", circleRoute.id, circle.name, user);
+      invalidateDiscovery();
       return json(response, 200, getState(user));
     }
 
@@ -1091,18 +1320,52 @@ async function handleApi(request, response, url) {
       }
       const creator = get("SELECT name FROM creators WHERE id = ?", [creatorId]);
       if (creator) setRecentActivity("creator", creatorId, creator.name, user);
+      invalidateDiscovery(user);
       return json(response, 200, getState(user));
     }
 
-    if (request.method === "POST" && url.pathname === "/api/viewed") {
+    if ((request.method === "POST" && url.pathname === "/api/viewed") || (request.method === "POST" && url.pathname === "/api/view")) {
       const payload = await readJson(request);
       const creatorId = Number(payload.creatorId);
       if (!creatorId) throw new Error("Creator is required.");
       const creator = get("SELECT name FROM creators WHERE id = ?", [creatorId]);
       if (creator) {
+        run("INSERT INTO creator_views (viewer_user_id, creator_id) VALUES (?, ?)", [user.id, creatorId]);
         markCreatorViewed(creatorId, user);
         setRecentActivity("creator", creatorId, creator.name, user);
       }
+      invalidateDiscovery(user);
+      return json(response, 200, getState(user));
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/follow") {
+      const payload = await readJson(request);
+      const creatorId = Number(payload.creatorId);
+      if (!creatorId) throw new Error("Creator is required.");
+      const myCreator = get("SELECT id FROM creators WHERE user_id = ? ORDER BY id LIMIT 1", [user.id]);
+      if (myCreator && Number(myCreator.id) === creatorId) {
+        const error = new Error("You cannot follow yourself.");
+        error.status = 400;
+        throw error;
+      }
+      const creator = get("SELECT name FROM creators WHERE id = ?", [creatorId]);
+      if (!creator) throw new Error("Creator was not found.");
+      const existing = get("SELECT id FROM creator_follows WHERE follower_user_id = ? AND creator_id = ?", [user.id, creatorId]);
+      if (existing) run("DELETE FROM creator_follows WHERE id = ?", [existing.id]);
+      else {
+        run("INSERT INTO creator_follows (follower_user_id, creator_id) VALUES (?, ?)", [user.id, creatorId]);
+        run("INSERT INTO contribution_activity (actor, action, points, user_id) VALUES (?, ?, ?, ?)", [creator.name, "gained a follower", 2, user.id]);
+      }
+      invalidateDiscovery(user);
+      return json(response, 200, getState(user));
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/hide") {
+      const payload = await readJson(request);
+      const creatorId = Number(payload.creatorId);
+      if (!creatorId) throw new Error("Creator is required.");
+      run("INSERT OR IGNORE INTO creator_hides (user_id, creator_id) VALUES (?, ?)", [user.id, creatorId]);
+      invalidateDiscovery(user);
       return json(response, 200, getState(user));
     }
 
@@ -1140,6 +1403,7 @@ async function handleApi(request, response, url) {
       run("INSERT INTO contribution_activity (actor, action, points, user_id) VALUES (?, ?, ?, ?)", [title, "collaboration request created", 12, user.id]);
       const row = get("SELECT id FROM collaboration_requests ORDER BY id DESC LIMIT 1");
       setRecentActivity("collaboration", row.id, title, user);
+      invalidateDiscovery();
       return json(response, 200, getState(user));
     }
 
@@ -1169,6 +1433,7 @@ async function handleApi(request, response, url) {
         ]);
       }
       setRecentActivity("settings", 1, "Application settings", user);
+      invalidateDiscovery(user);
       return json(response, 200, getState(user));
     }
 

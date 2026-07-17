@@ -475,6 +475,7 @@
         <div class="panel featured-home">${panelHeader("Featured Creator", "")}${featuredCreatorView()}</div>
         <div class="panel">${panelHeader("Community Activity", "")}${activityList(data.activity.slice(0, 8))}</div>
         <div class="panel radar-home">${panelHeader("Creator Radar", "")}${radarView()}</div>
+        ${homeDiscoveryWidgets()}
       </section>`;
   }
 
@@ -559,6 +560,27 @@
     return `<div class="records-list">${matches.map((match) => `<article class="record-card"><header><h3>${escapeHtml(match.title)}</h3><span class="mini-pill">${escapeHtml(match.kind)}</span></header><p>${escapeHtml(match.text || "Matched CAP record.")}</p><div class="pill-row">${match.hits.map((hit) => `<span class="mini-pill">${escapeHtml(hit)}</span>`).join("")}</div><div class="inline-buttons">${match.creatorId ? `<button class="secondary-button" data-view-profile="${match.creatorId}">View Profile</button><button class="secondary-button" data-work="${match.creatorId}">Let's Work Together</button>` : `<button class="secondary-button" data-nav="${match.nav}">Open</button>`}</div></article>`).join("")}</div>`;
   }
 
+  function creatorMiniCards(creators, empty) {
+    if (!creators?.length) return `<p class="empty-copy">${escapeHtml(empty)}</p>`;
+    return `<div class="records-list">${creators.map((creator) => `<article class="record-card">
+      <div class="record-main">
+        ${imageWithFallback(creator.image, "directory-avatar", creator.name, "directory-avatar placeholder", initials(creator.name))}
+        <div><h3>${escapeHtml(creator.name)}</h3><p>${escapeHtml(creator.role || creator.category || "Creator")}</p><small>${escapeHtml((creator.discoveryReasons || []).slice(0, 2).join(" - "))}</small></div>
+      </div>
+      <div class="inline-buttons"><button class="secondary-button" data-view-profile="${creator.id}">View Profile</button><button class="secondary-button" data-follow="${creator.id}">${creator.followed ? "Following" : "Follow"}</button></div>
+    </article>`).join("")}</div>`;
+  }
+
+  function homeDiscoveryWidgets() {
+    const widgets = state.data.homeRecommendations || {};
+    return `
+      <div class="panel">${panelHeader("Recommended Creators", "")}${creatorMiniCards(widgets.recommendedCreators, "No recommendations yet. CAP will rank creators as profiles gain skills, interests, and activity.")}</div>
+      <div class="panel">${panelHeader("People Near Your Interests", "")}${creatorMiniCards(widgets.peopleNearYourInterests, "No interest matches yet.")}</div>
+      <div class="panel">${panelHeader("New Creators", "")}${creatorMiniCards(widgets.newCreators, "No new creators yet.")}</div>
+      <div class="panel">${panelHeader("Recently Joined", "")}${creatorMiniCards(widgets.recentlyJoined, "No recent joins yet.")}</div>
+      <div class="panel">${panelHeader("Trending Creators", "")}${creatorMiniCards(widgets.trendingCreators, "No trending creators yet.")}</div>`;
+  }
+
   function circleList(circles) {
     if (!circles.length) return `<p class="empty-copy">No creator circles yet. Create a circle to start grouping creators by community, topic, or collaboration goal.</p>`;
     return `<div class="circle-list">${circles.map((circle) => `
@@ -570,8 +592,8 @@
   }
 
   function discoveryCard() {
-    const creators = filteredCreators();
-    if (!creators.length) return `<p class="empty-copy">No creators in the discovery queue yet. Add creators in the Directory to browse, save, watch, and collaborate.</p>`;
+    const creators = state.data.discovery || [];
+    if (!creators.length) return `<p class="empty-copy">No recommended creators right now. CAP will refresh the queue as new creators, skills, follows, saves, and activity appear.</p>`;
     const creator = creators[state.discoveryIndex % creators.length];
     const video = creator.videos?.[0];
     return `
@@ -585,12 +607,16 @@
           ${creator.category ? `<span class="category-pill">${escapeHtml(creator.category)}</span>` : ""}
           <p class="creator-role">${escapeHtml(creator.role || "No role entered")}</p>
           <p class="creator-description">${escapeHtml(creator.description || "No description entered yet.")}</p>
+          ${creator.discoveryReasons?.length ? `<div class="pill-row">${creator.discoveryReasons.slice(0, 3).map((reason) => `<span class="mini-pill">${escapeHtml(reason)}</span>`).join("")}</div>` : ""}
           ${platformButtons(creator)}
           ${video ? embedVideo(video.url) : ""}
           <div class="creator-buttons">
             ${video ? `<button class="watch-button" data-open="${escapeHtml(video.url)}">${iconMap.Play} Watch Featured Work</button>` : ""}
+            <button class="secondary-button" data-view-profile="${creator.id}">View Profile</button>
+            <button class="secondary-button" data-follow="${creator.id}">${creator.followed ? "Following" : "Follow"}</button>
             <button class="secondary-button" data-save="${creator.id}">${creator.saved ? "Saved" : "Save"}</button>
             <button class="secondary-button" data-work="${creator.id}">Let's Work Together</button>
+            <button class="secondary-button" data-hide="${creator.id}">Hide</button>
             <button class="secondary-button" data-next>Next</button>
           </div>
         </div>
@@ -778,6 +804,10 @@
     return `<article class="record-card"><header><h3>${escapeHtml(title)}</h3><span class="mini-pill">${escapeHtml(value)}</span></header><p>${escapeHtml(detail)}</p></article>`;
   }
 
+  function adminRanking(title, rows) {
+    return `<article class="record-card"><header><h3>${escapeHtml(title)}</h3><span class="mini-pill">${Number(rows?.length || 0)}</span></header>${rows?.length ? `<div class="records-list compact-records">${rows.map((row) => `<p>${escapeHtml(row.name)} - ${Number(row.count || 0)}</p>`).join("")}</div>` : `<p>No activity yet.</p>`}</article>`;
+  }
+
   function adminSection() {
     const admin = state.data.admin || {};
     return `<div class="panel admin-panel">
@@ -806,6 +836,10 @@
           ${adminMetric("Circles", admin.analytics?.circles || 0, "Creator circle records.")}
           ${adminMetric("Memberships", admin.analytics?.circleMemberships || 0, "Circle membership records.")}
           ${adminMetric("Contribution points", admin.analytics?.contributionPoints || 0, "Total points generated by real activity.")}
+          ${adminRanking("Most viewed creators", admin.analytics?.mostViewedCreators || [])}
+          ${adminRanking("Most followed creators", admin.analytics?.mostFollowedCreators || [])}
+          ${adminRanking("Most saved creators", admin.analytics?.mostSavedCreators || [])}
+          ${adminRanking("Fastest growing creators", admin.analytics?.fastestGrowingCreators || [])}
         </div>
         <div>
           <h3>Platform Settings</h3>
@@ -865,6 +899,25 @@
     return `<section class="profile-section"><h3>Projects</h3><div class="records-list compact-records">${projects.map((project) => `<article class="record-card"><header><h4>${escapeHtml(project.title)}</h4><span class="mini-pill">${escapeHtml(project.status || "Requested")}</span></header><p>${escapeHtml(project.message || "No project details added yet.")}</p><div class="progress-track"><span style="width:${Number(project.progress || 0)}%"></span></div></article>`).join("")}</div></section>`;
   }
 
+  function creatorSocialSection(creator) {
+    const social = creator.social || {};
+    const mutualCircles = social.mutualCircles || [];
+    const mutualSkills = social.mutualSkills || [];
+    const sharedInterests = social.sharedInterests || [];
+    return `<section class="profile-section full-span"><h3>Community Context</h3>
+      <div class="stats-grid">
+        ${stat(iconMap.Users, social.followers || 0, "Followers")}
+        ${stat(iconMap.Handshake, social.following || 0, "Following")}
+      </div>
+      <div class="pill-row">
+        ${mutualCircles.map((circle) => `<span class="mini-pill">${escapeHtml(circle.name)}</span>`).join("")}
+        ${mutualSkills.map((skill) => `<span class="mini-pill">Skill: ${escapeHtml(skill)}</span>`).join("")}
+        ${sharedInterests.map((interest) => `<span class="mini-pill">Interest: ${escapeHtml(interest)}</span>`).join("")}
+      </div>
+      ${!(mutualCircles.length || mutualSkills.length || sharedInterests.length) ? `<p class="empty-copy slim">No mutual circles, skills, or shared interests yet.</p>` : ""}
+    </section>`;
+  }
+
   function creatorProfileView() {
     const creator = state.viewingCreator;
     if (!creator) return `<section class="empty-page"><div class="empty-icon">!</div><h2>Creator not found</h2><p>Select a creator from the Directory or Discovery queue.</p><button class="primary-button" data-nav="Directory">Back to Directory</button></section>`;
@@ -898,6 +951,7 @@
           ${profilePortfolioSection(creator)}
           ${profileTextSection("Collaboration Interests", creator.collaboration_interests, "No collaboration interests added yet.")}
           ${profileTextSection("Looking For", creator.looking_for, "No collaboration needs added yet.")}
+          ${creatorSocialSection(creator)}
           ${profileCircleSection(creator)}
           ${profileProjectSection(creator)}
         </div>
@@ -1058,9 +1112,33 @@
       state.status = "";
       render();
     });
-    root.querySelector("[data-next]")?.addEventListener("click", (event) => { event.stopPropagation(); state.discoveryIndex += 1; render(); });
+    root.querySelector("[data-next]")?.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      const queue = state.data.discovery || [];
+      if (queue.length && state.discoveryIndex + 1 >= queue.length) {
+        const payload = await api("/api/discovery?refresh=1", { method: "GET" });
+        state.data.discovery = payload.recommendations || [];
+        state.discoveryIndex = 0;
+      } else {
+        state.discoveryIndex += 1;
+      }
+      render();
+    });
     root.querySelectorAll("[data-open]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); window.open(button.dataset.open, "_blank"); }));
     root.querySelectorAll("[data-save]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); submit("/api/saved", { creatorId: Number(button.dataset.save) }); }));
+    root.querySelectorAll("[data-follow]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); submit("/api/follow", { creatorId: Number(button.dataset.follow) }); }));
+    root.querySelectorAll("[data-hide]").forEach((button) => button.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      try {
+        state.data = await api("/api/hide", { method: "POST", body: JSON.stringify({ creatorId: Number(button.dataset.hide) }) });
+        state.discoveryIndex = 0;
+        state.status = "Hidden from your queue.";
+        render();
+      } catch (error) {
+        state.status = error.message;
+        render(true);
+      }
+    }));
     root.querySelectorAll("[data-support]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); submit("/api/support", { creatorId: Number(button.dataset.support) }); }));
     root.querySelectorAll("[data-view-profile]").forEach((button) => button.addEventListener("click", async (event) => {
       event.stopPropagation();
