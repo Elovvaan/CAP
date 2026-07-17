@@ -759,6 +759,8 @@ function getDiscoveryQueue(user, force = false) {
     })
     .sort((a, b) => b.score - a.score || new Date(b.updated_at || b.created_at).getTime() - new Date(a.updated_at || a.created_at).getTime());
 
+  // Avoid unbounded growth if many users hit discovery.
+  if (discoveryCache.size > 5000) discoveryCache.delete(discoveryCache.keys().next().value);
   discoveryCache.set(user.id, recommendations);
   return recommendations;
 }
