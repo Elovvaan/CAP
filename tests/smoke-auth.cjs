@@ -8,13 +8,15 @@ const projectRoot = path.resolve(__dirname, "..");
 const dir = path.join(os.tmpdir(), `cap-auth-test-${Date.now()}`);
 fs.mkdirSync(dir, { recursive: true });
 
+const envPort = String(18_000 + Math.floor(Math.random() * 10_000));
+
 const env = {
   ...process.env,
   CAP_DATA_DIR: dir,
   CAP_FOUNDER_EMAIL: "founder@example.test",
   CAP_FOUNDER_PASSWORD: "FounderPassword123!",
   CAP_HOST: "127.0.0.1",
-  PORT: "18320",
+  PORT: envPort,
   CAP_NO_OPEN: "1"
 };
 
@@ -28,7 +30,7 @@ let output = "";
 child.stdout.on("data", (data) => { output += data; });
 child.stderr.on("data", (data) => { output += data; });
 
-const base = "http://127.0.0.1:18320";
+const base = `http://127.0.0.1:${envPort}`;
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function request(pathname, options = {}) {
