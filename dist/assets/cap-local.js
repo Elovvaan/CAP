@@ -9,6 +9,7 @@
     ["Settings", "Settings", "S"]
   ];
   const state = { active: "Home", query: "", data: null, viewingCreator: null, discoveryIndex: 0, status: "", authUser: null, authMode: "signin", authReady: false };
+  const maxImageBytes = 15 * 1024 * 1024;
   const root = document.getElementById("root");
 
   const iconMap = {
@@ -946,10 +947,22 @@
     return Object.fromEntries(new FormData(form).entries());
   }
 
+  function validateSelectedImage(file) {
+    if (!file) return "";
+    if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) return "Choose a PNG, JPG, JPEG, or WebP image.";
+    if (file.size > maxImageBytes) return "Image must be 15 MB or smaller.";
+    return "";
+  }
+
   function readFile(input) {
     return new Promise((resolve) => {
       const file = input.files?.[0];
       if (!file) return resolve("");
+      const validationError = validateSelectedImage(file);
+      if (validationError) {
+        input.value = "";
+        throw new Error(validationError);
+      }
       const reader = new FileReader();
       reader.onload = () => resolve({ file, data: reader.result });
       reader.readAsDataURL(file);
@@ -1009,8 +1022,9 @@
         const preview = root.querySelector(`[data-upload-preview="${target}"]`);
         const textInput = root.querySelector(`input[name="${target}"]`);
         if (!preview || !file) return;
-        if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) {
-          preview.innerHTML = `<span>Choose a PNG, JPG, JPEG, or WebP image.</span>`;
+        const validationError = validateSelectedImage(file);
+        if (validationError) {
+          preview.innerHTML = `<span>${escapeHtml(validationError)}</span>`;
           preview.classList.add("missing");
           input.value = "";
           return;
