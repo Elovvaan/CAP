@@ -355,7 +355,7 @@ function currentUserFromRequest(request) {
 function createSession(response, request, userId) {
   const token = crypto.randomBytes(32).toString("base64url");
   const expiresAt = new Date(Date.now() + sessionDurationMs).toISOString();
-  run("DELETE FROM sessions WHERE expires_at <= datetime('now')");
+  run("DELETE FROM sessions WHERE expires_at <= ?", [new Date().toISOString()]);
   run(
     "INSERT INTO sessions (user_id, token_hash, expires_at, user_agent, ip_address) VALUES (?, ?, ?, ?, ?)",
     [userId, tokenHash(token), expiresAt, sanitizeText(request.headers["user-agent"]), sanitizeText(request.socket.remoteAddress)]
