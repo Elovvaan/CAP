@@ -303,10 +303,22 @@ function tokenHash(token) {
 }
 
 function parseCookies(request) {
-  return Object.fromEntries(String(request.headers.cookie || "").split(";").map((part) => {
-    const [key, ...rest] = part.trim().split("=");
-    return [key, decodeURIComponent(rest.join("=") || "")];
-  }).filter(([key]) => key));
+  return Object.fromEntries(
+    String(request.headers.cookie || "")
+      .split(";")
+      .map((part) => {
+        const [key, ...rest] = part.trim().split("=");
+        const raw = rest.join("=") || "";
+        let value = raw;
+        try {
+          value = decodeURIComponent(raw);
+        } catch {
+          value = raw;
+        }
+        return [key, value];
+      })
+      .filter(([key]) => key)
+  );
 }
 
 function cookieHeader(name, value, options = {}) {
@@ -357,7 +369,7 @@ function currentUserFromRequest(request) {
 function createSession(response, request, userId) {
   const token = crypto.randomBytes(32).toString("base64url");
   const expiresAt = new Date(Date.now() + sessionDurationMs).toISOString();
-  run("DELETE FROM sessions WHERE expires_at <= datetime('now')");
+  run("DELETE FROM sessions WHERE expires_at <= ?", [new Date().toISOString()]);
   run(
     "INSERT INTO sessions (user_id, token_hash, expires_at, user_agent, ip_address) VALUES (?, ?, ?, ?, ?)",
     [userId, tokenHash(token), expiresAt, sanitizeText(request.headers["user-agent"]), sanitizeText(request.socket.remoteAddress)]
@@ -498,12 +510,22 @@ function sanitizeText(value) {
 }
 
 function clientKey(request, scope) {
-  return `${scope}:${request.socket.remoteAddress || "local"}`;
+  const forwarded = String(request.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  const ip = isHosted && forwarded ? forwarded : (request.socket.remoteAddress || "local");
+  return `${scope}:${ip}`;
 }
 
 function checkRateLimit(request, scope) {
-  const key = clientKey(request, scope);
   const now = Date.now();
+
+  // Best-effort pruning to avoid unbounded growth.
+  if (authAttempts.size > 1000) {
+    for (const [key, entry] of authAttempts) {
+      if (entry.resetAt <= now) authAttempts.delete(key);
+    }
+  }
+
+  const key = clientKey(request, scope);
   const current = authAttempts.get(key) || { count: 0, resetAt: now + authLimitWindowMs };
   if (current.resetAt <= now) {
     current.count = 0;
@@ -811,10 +833,12 @@ function saveCreator(payload, id = null, user = null, options = {}) {
   if (creatorId) {
     const existing = get("SELECT * FROM creators WHERE id = ?", [creatorId]);
     if (!existing) throw new Error("Creator was not found.");
-    if (!options.admin && user && existing.user_id && existing.user_id !== user.id) {
-      const error = new Error("You can only edit your own creator profile.");
-      error.status = 403;
-      throw error;
+    if (!options.admin && user) {
+      if (!existing.user_id || existing.user_id !== user.id) {
+        const error = new Error("You can only edit your own creator profile.");
+        error.status = 403;
+        throw error;
+      }
     }
     run(
       `UPDATE creators
