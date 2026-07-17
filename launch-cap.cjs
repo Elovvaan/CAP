@@ -15,7 +15,9 @@ const preferredPort = Number(process.env.PORT || process.env.CAP_PORT || 1420);
 const logPath = process.env.CAP_LOG_PATH || (isHosted ? path.join(dataDir, "cap-launch.log") : path.join(__dirname, "cap-launch.log"));
 const sessionCookieName = "cap_session";
 const sessionDurationMs = 30 * 24 * 60 * 60 * 1000;
-const maxJsonBytes = 2_000_000;
+const maxJsonBytes = 2 * 1024 * 1024;
+const maxUploadJsonBytes = 25 * 1024 * 1024;
+const maxDecodedImageBytes = 15 * 1024 * 1024;
 const authLimitWindowMs = 15 * 60 * 1000;
 const authLimitMax = 20;
 const authAttempts = new Map();
@@ -441,7 +443,13 @@ function markCreatorViewed(creatorId, user = null) {
   setSetting(userSettingKey(user, "viewedCreators"), viewed);
 }
 
-function readJson(request) {
+function uploadError(message, status = 400) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+function readJson(request, maxBytes = maxJsonBytes) {
   return new Promise((resolve, reject) => {
     const contentType = String(request.headers["content-type"] || "");
     if (!contentType.includes("application/json")) {
@@ -451,20 +459,21 @@ function readJson(request) {
       return;
     }
     let body = "";
+    let tooLarge = false;
     request.on("data", (chunk) => {
+      if (tooLarge) return;
       body += chunk;
-      if (Buffer.byteLength(body) > maxJsonBytes) {
-        request.destroy();
-        const error = new Error("Request body is too large.");
-        error.status = 413;
-        reject(error);
+      if (Buffer.byteLength(body) > maxBytes) {
+        tooLarge = true;
+        body = "";
       }
     });
     request.on("end", () => {
       try {
+        if (tooLarge) throw uploadError("Request payload is too large.", 413);
         resolve(body ? JSON.parse(body) : {});
       } catch (error) {
-        reject(error);
+        reject(error.status ? error : uploadError("Malformed upload payload."));
       }
     });
     request.on("error", reject);
@@ -530,34 +539,49 @@ function assertSafeMutationOrigin(request) {
   }
 }
 
-function uploadExtension(name, type, dataUrl) {
-  const extension = path.extname(sanitizeText(name)).toLowerCase().replace(".", "");
-  const mime = sanitizeText(type).toLowerCase() || (String(dataUrl).match(/^data:([^;]+);base64,/) || [])[1] || "";
+function imageTypeFromMime(mime) {
   const allowed = new Map([
-    ["png", "png"],
-    ["jpg", "jpg"],
-    ["jpeg", "jpg"],
-    ["webp", "webp"],
     ["image/png", "png"],
     ["image/jpeg", "jpg"],
     ["image/jpg", "jpg"],
     ["image/webp", "webp"]
   ]);
-  return allowed.get(extension) || allowed.get(mime) || "";
+  return allowed.get(sanitizeText(mime).toLowerCase()) || "";
+}
+
+function imageTypeFromExtension(name) {
+  const extension = path.extname(sanitizeText(name)).toLowerCase().replace(".", "");
+  if (extension === "jpeg") return "jpg";
+  return ["png", "jpg", "webp"].includes(extension) ? extension : "";
+}
+
+function uploadExtension(name, type, dataMime) {
+  const extensionType = imageTypeFromExtension(name);
+  const declaredType = imageTypeFromMime(type);
+  const dataType = imageTypeFromMime(dataMime);
+  if (!declaredType || !dataType || !extensionType) return "";
+  if (declaredType !== dataType) return "";
+  if (extensionType !== dataType) return "";
+  return dataType;
 }
 
 function saveUploadedImage(payload) {
   const dataUrl = sanitizeText(payload.data);
-  const extension = uploadExtension(payload.name, payload.type, dataUrl);
-  if (!extension) throw new Error("Please choose a PNG, JPG, JPEG, or WebP image.");
-  const match = dataUrl.match(/^data:[^;]+;base64,(.+)$/);
-  if (!match) throw new Error("The selected image could not be read.");
-  const buffer = Buffer.from(match[1], "base64");
-  if (!buffer.length) throw new Error("The selected image is empty.");
-  fs.mkdirSync(uploadDir, { recursive: true });
+  const match = dataUrl.match(/^data:([^;]+);base64,([A-Za-z0-9+/=\r\n]*)$/);
+  if (!match) throw uploadError("Malformed upload payload.");
+  const extension = uploadExtension(payload.name, payload.type, match[1]);
+  if (!extension) throw uploadError("Unsupported image type. Please choose a PNG, JPG, JPEG, or WebP image.");
+  const imageBuffer = Buffer.from(match[2], "base64");
+  if (!imageBuffer.length) throw uploadError("The selected image is empty.");
+  if (imageBuffer.length > maxDecodedImageBytes) throw uploadError("Image must be 15 MB or smaller.", 413);
   const filename = `${Date.now()}-${crypto.randomUUID()}.${extension}`;
   const absolutePath = path.join(uploadDir, filename);
-  fs.writeFileSync(absolutePath, buffer);
+  try {
+    fs.mkdirSync(uploadDir, { recursive: true });
+    fs.writeFileSync(absolutePath, imageBuffer);
+  } catch {
+    throw uploadError("Upload storage write failed.", 500);
+  }
   return `data/uploads/${filename}`;
 }
 
@@ -982,7 +1006,7 @@ async function handleApi(request, response, url) {
     if (request.method === "GET" && url.pathname === "/api/state") return json(response, 200, getState(user));
 
     if (request.method === "POST" && url.pathname === "/api/uploads") {
-      const storedPath = saveUploadedImage(await readJson(request));
+      const storedPath = saveUploadedImage(await readJson(request, maxUploadJsonBytes));
       return json(response, 200, { path: storedPath });
     }
 

@@ -68,6 +68,18 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+function dataUrl(mime, byteCount) {
+  return `data:${mime};base64,${Buffer.alloc(byteCount, 7).toString("base64")}`;
+}
+
+async function upload(cookieValue, payload) {
+  return request("/api/uploads", {
+    method: "POST",
+    headers: { Cookie: cookieValue },
+    body: JSON.stringify(payload)
+  });
+}
+
 (async () => {
   try {
     await waitForServer();
@@ -96,6 +108,34 @@ function assert(condition, message) {
       body: JSON.stringify({ name: "User A Creator", handle: "usera", role: "Filmmaker", category: "Film", bio: "A bio", skills: "editing", location: "Denver" })
     });
     assert(profileA.response.status === 200 && profileA.body.currentUser.creatorProfileId, "User A profile failed");
+
+    const smallPng = await upload(cookieA, { name: "small.png", type: "image/png", data: dataUrl("image/png", 128) });
+    assert(smallPng.response.status === 200 && smallPng.body.path, "small PNG upload failed");
+
+    const jpg = await upload(cookieA, { name: "photo.jpg", type: "image/jpeg", data: dataUrl("image/jpeg", 3 * 1024 * 1024) });
+    assert(jpg.response.status === 200 && jpg.body.path, "3 MB JPG upload failed");
+
+    const webp = await upload(cookieA, { name: "image.webp", type: "image/webp", data: dataUrl("image/webp", 1024) });
+    assert(webp.response.status === 200 && webp.body.path, "WebP upload failed");
+
+    const nearLimit = await upload(cookieA, { name: "near-limit.jpg", type: "image/jpeg", data: dataUrl("image/jpeg", 14 * 1024 * 1024) });
+    assert(nearLimit.response.status === 200 && nearLimit.body.path, "14 MB JPG upload failed");
+
+    const aboveLimit = await upload(cookieA, { name: "too-large.jpg", type: "image/jpeg", data: dataUrl("image/jpeg", 16 * 1024 * 1024) });
+    assert(aboveLimit.response.status === 413 && /15 MB/.test(aboveLimit.body.error), "oversized image was not rejected");
+
+    const unsupported = await upload(cookieA, { name: "notes.txt", type: "text/plain", data: dataUrl("text/plain", 128) });
+    assert(unsupported.response.status === 400 && /Unsupported image type/.test(unsupported.body.error), "unsupported file type was not rejected");
+
+    const malformed = await upload(cookieA, { name: "bad.png", type: "image/png", data: "data:image/png;base64,not-valid-@@@" });
+    assert(malformed.response.status === 400 && /Malformed upload payload/.test(malformed.body.error), "malformed base64 was not rejected");
+
+    const largeJson = await request("/api/settings", {
+      method: "POST",
+      headers: { Cookie: cookieA },
+      body: JSON.stringify({ notes: "x".repeat((2 * 1024 * 1024) + 1) })
+    });
+    assert(largeJson.response.status === 413, "regular JSON over 2 MB was not rejected");
 
     const profileB = await request("/api/my-profile", {
       method: "POST",
