@@ -1,0 +1,1023 @@
+(() => {
+  const navItems = [
+    ["Home", "Home", "H"],
+    ["Directory", "Creator Directory", "D"],
+    ["Circles", "Creator Circles", "C"],
+    ["Discovery", "Discovery Queue", "Q"],
+    ["Collaborations", "Collaborations", "W"],
+    ["Messages", "Messages", "M"],
+    ["Settings", "Settings", "S"]
+  ];
+  const state = { active: "Home", query: "", data: null, viewingCreator: null, discoveryIndex: 0, status: "" };
+  const root = document.getElementById("root");
+
+  const iconMap = {
+    Home: "H", Directory: "D", Circles: "C", Discovery: "Q", Collaborations: "W", Messages: "M", Settings: "S",
+    Users: "U", Handshake: "W", Sparkles: "*", Star: "*", Play: ">", Plus: "+", Bell: "!"
+  };
+
+  function escapeHtml(value) {
+    return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
+  }
+
+  function initials(name) {
+    const parts = String(name || "CAP").trim().split(/\s+/).filter(Boolean);
+    return (parts[0]?.[0] || "C") + (parts[1]?.[0] || "");
+  }
+
+  function imageSrc(value) {
+    const source = String(value || "").trim();
+    if (!source) return "";
+    if (/^(https?:|data:|\.\/|\/assets\/)/i.test(source)) return source;
+    if (source.startsWith("data/uploads/")) return `/media/${encodeURIComponent(source)}`;
+    return `/media/${encodeURIComponent(source)}`;
+  }
+
+  function imageWithFallback(value, imgClass, alt, fallbackClass, fallbackText) {
+    const source = imageSrc(value);
+    const fallback = `<div class="${fallbackClass}">${escapeHtml(fallbackText)}</div>`;
+    if (!source) return fallback;
+    return `<span class="image-fallback-shell"><img class="${imgClass}" src="${escapeHtml(source)}" alt="${escapeHtml(alt)}" onerror="this.parentElement.classList.add('image-load-failed')">${fallback.replace('class="', 'class="image-fallback-hidden ')}</span>`;
+  }
+
+  function relativeTime(value) {
+    if (!value) return "";
+    const delta = Math.max(0, Date.now() - new Date(value.replace(" ", "T") + "Z").getTime());
+    const minutes = Math.floor(delta / 60000);
+    if (minutes < 1) return "now";
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    return `${Math.floor(hours / 24)}d ago`;
+  }
+
+  async function api(path, options = {}) {
+    const response = await fetch(path, {
+      ...options,
+      headers: { "Content-Type": "application/json", ...(options.headers || {}) }
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "Request failed.");
+    return payload;
+  }
+
+  async function refresh() {
+    state.data = await api("/api/state");
+    render();
+  }
+
+  async function submit(path, payload, method = "POST") {
+    try {
+      state.data = await api(path, { method, body: JSON.stringify(payload) });
+      state.status = "Saved.";
+      render();
+    } catch (error) {
+      state.status = error.message;
+      render(true);
+    }
+  }
+
+  function filteredCreators() {
+    const creators = state.data?.creators || [];
+    const query = state.query.toLowerCase();
+    if (!query) return creators;
+    return creators.filter((creator) => [creator.name, creator.handle, creator.role, creator.category, creator.description, ...(creator.platforms || []).map((p) => `${p.platform} ${p.url}`)]
+      .join(" ").toLowerCase().includes(query));
+  }
+
+  function filteredCircles() {
+    const circles = state.data?.circles || [];
+    const query = state.query.toLowerCase();
+    if (!query) return circles;
+    return circles.filter((circle) => [circle.name, circle.detail].join(" ").toLowerCase().includes(query));
+  }
+
+  function settingList(key) {
+    return String(state.data?.settings?.[key] || "")
+      .split(/[,|\n]/)
+      .map((item) => item.trim().toLowerCase())
+      .filter(Boolean);
+  }
+
+  function viewedCreatorIds() {
+    try {
+      return JSON.parse(state.data?.settings?.viewedCreators || "[]").map(Number);
+    } catch {
+      return [];
+    }
+  }
+
+  function profileCompleteness(creator) {
+    const checks = [creator.name, creator.handle, creator.role, creator.category, creator.description, creator.image, creator.banner];
+    const relationCount = (creator.platforms?.length ? 1 : 0) + (creator.videos?.length ? 1 : 0);
+    return checks.filter(Boolean).length + relationCount;
+  }
+
+  function searchableCreatorText(creator) {
+    return [
+      creator.name,
+      creator.handle,
+      creator.role,
+      creator.category,
+      creator.description,
+      ...(creator.platforms || []).map((item) => `${item.platform} ${item.url}`),
+      ...(creator.videos || []).map((item) => `${item.title} ${item.url}`)
+    ].join(" ").toLowerCase();
+  }
+
+  function getFeaturedCreator() {
+    const viewed = new Set(viewedCreatorIds());
+    const creators = [...(state.data?.creators || [])];
+    if (!creators.length) return null;
+    return creators
+      .sort((a, b) => {
+        const viewedDelta = Number(viewed.has(a.id)) - Number(viewed.has(b.id));
+        if (viewedDelta) return viewedDelta;
+        const completeDelta = profileCompleteness(b) - profileCompleteness(a);
+        if (completeDelta) return completeDelta;
+        return new Date(b.updated_at || b.created_at).getTime() - new Date(a.updated_at || a.created_at).getTime();
+      })[0];
+  }
+
+  function getOpportunities() {
+    const data = state.data;
+    const opportunities = [];
+    for (const item of data.collaborations.filter((collab) => collab.status !== "Completed").slice(0, 4)) {
+      opportunities.push({
+        type: "collaboration",
+        title: item.title,
+        text: `${item.status}${item.creator_name ? ` with ${item.creator_name}` : ""}`,
+        nav: "Collaborations"
+      });
+    }
+    for (const creator of data.creators) {
+      const text = searchableCreatorText(creator);
+      if (/(seeking|needs|looking for|collab|collaboration|support|help)/i.test(text)) {
+        opportunities.push({
+          type: "creator",
+          title: creator.name,
+          text: creator.description || creator.role || "Creator profile has collaboration signals.",
+          creatorId: creator.id
+        });
+      }
+    }
+    for (const circle of data.circles.filter((circle) => Number(circle.members || 0) === 0 || /(support|growth|help|members|collab)/i.test(`${circle.name} ${circle.detail}`))) {
+      opportunities.push({
+        type: "circle",
+        title: circle.name,
+        text: Number(circle.members || 0) === 0 ? "Circle needs its first members." : circle.detail,
+        nav: "Circles"
+      });
+    }
+    return opportunities.slice(0, 6);
+  }
+
+  function getRadarMatches() {
+    const terms = [
+      ...settingList("skills"),
+      ...settingList("interests"),
+      ...settingList("location"),
+      ...settingList("platforms"),
+      ...settingList("categories"),
+      ...settingList("collaborationNeeds")
+    ];
+    if (!terms.length) return [];
+    const matches = [];
+    for (const creator of state.data.creators) {
+      const text = searchableCreatorText(creator);
+      const hits = [...new Set(terms.filter((term) => text.includes(term)))];
+      if (hits.length) matches.push({ kind: "creator", title: creator.name, text: creator.role || creator.category || creator.description, hits, creatorId: creator.id });
+    }
+    for (const circle of state.data.circles) {
+      const text = `${circle.name} ${circle.detail}`.toLowerCase();
+      const hits = [...new Set(terms.filter((term) => text.includes(term)))];
+      if (hits.length) matches.push({ kind: "circle", title: circle.name, text: circle.detail || `${Number(circle.members || 0)} members`, hits, nav: "Circles" });
+    }
+    for (const collab of state.data.collaborations.filter((item) => item.status !== "Completed")) {
+      const text = `${collab.title} ${collab.message} ${collab.creator_name}`.toLowerCase();
+      const hits = [...new Set(terms.filter((term) => text.includes(term)))];
+      if (hits.length) matches.push({ kind: "project", title: collab.title, text: collab.message || collab.status, hits, nav: "Collaborations" });
+    }
+    return matches.sort((a, b) => b.hits.length - a.hits.length).slice(0, 6);
+  }
+
+  function platformLabel(item) {
+    const explicit = String(item.platform || "").trim();
+    const url = String(item.url || "").toLowerCase();
+    if (explicit) return explicit;
+    if (url.includes("youtube.com") || url.includes("youtu.be")) return "YouTube";
+    if (url.includes("instagram.com")) return "Instagram";
+    if (url.includes("facebook.com") || url.includes("fb.com")) return "Facebook";
+    if (url.includes("tiktok.com")) return "TikTok";
+    if (url.includes("x.com") || url.includes("twitter.com")) return "X";
+    if (url.includes("vimeo.com")) return "Vimeo";
+    if (url.includes("spotify.com")) return "Spotify";
+    if (url) return "Website";
+    return "Platform";
+  }
+
+  function platformButtons(creator) {
+    const links = (creator.platforms || []).filter((item) => item.url);
+    if (!links.length) return `<p class="platforms">No platform links yet</p>`;
+    return `<div class="platform-buttons">${links.map((item) => `<button class="platform-button" data-open="${escapeHtml(item.url)}">${escapeHtml(platformLabel(item))}</button>`).join("")}</div>`;
+  }
+
+  function coverImage(creator) {
+    const source = imageSrc(creator.banner || creator.image);
+    if (!source) return "";
+    return `<img class="creator-cover-image" src="${escapeHtml(source)}" alt="${escapeHtml(creator.name)} cover" onerror="this.style.display='none'"><div class="creator-cover-scrim"></div>`;
+  }
+
+  function uniqueTerms(values) {
+    return [...new Set(values.flatMap((value) => String(value || "").split(/[,|\n]/)).map((item) => item.trim().toLowerCase()).filter(Boolean))];
+  }
+
+  function getWelcomeMatches() {
+    const nicheTerms = uniqueTerms([
+      state.data.settings.category,
+      state.data.settings.categories,
+      state.data.settings.interests,
+      state.data.settings.collaborationInterests
+    ]);
+    const skillTerms = uniqueTerms([state.data.settings.skills]);
+    const locationTerms = uniqueTerms([state.data.settings.location]);
+    const areaEnabled = locationTerms.length > 0;
+
+    const creatorMatches = state.data.creators
+      .map((creator) => ({ creator, text: searchableCreatorText(creator) }))
+      .filter((item) => nicheTerms.some((term) => item.text.includes(term)))
+      .slice(0, 4);
+    const areaMatches = areaEnabled
+      ? state.data.creators
+        .map((creator) => ({ creator, text: searchableCreatorText(creator) }))
+        .filter((item) => locationTerms.some((term) => item.text.includes(term)))
+        .slice(0, 4)
+      : [];
+    const skillSeekers = state.data.creators
+      .map((creator) => ({ creator, text: searchableCreatorText(creator) }))
+      .filter((item) => /(seeking|needs|looking for|support|help|collab|collaboration)/i.test(item.text) && skillTerms.some((term) => item.text.includes(term)))
+      .slice(0, 4);
+    const activeCollaborations = state.data.collaborations
+      .filter((item) => item.status !== "Completed")
+      .filter((item) => {
+        const text = `${item.title} ${item.message} ${item.creator_name}`.toLowerCase();
+        const terms = [...nicheTerms, ...skillTerms, ...locationTerms];
+        return !terms.length || terms.some((term) => text.includes(term));
+      })
+      .slice(0, 4);
+    const relevantCircles = state.data.circles
+      .filter((circle) => {
+        const text = `${circle.name} ${circle.detail}`.toLowerCase();
+        const terms = [...nicheTerms, ...skillTerms, ...locationTerms];
+        return terms.some((term) => text.includes(term));
+      })
+      .slice(0, 4);
+
+    return {
+      areaEnabled,
+      creatorMatches,
+      areaMatches,
+      activeCollaborations,
+      relevantCircles,
+      skillSeekers,
+      hasMatches: Boolean(creatorMatches.length || areaMatches.length || activeCollaborations.length || relevantCircles.length || skillSeekers.length)
+    };
+  }
+
+  function pageTitle() {
+    if (state.active === "Home") return state.data?.profile?.name ? `Welcome back, ${state.data.profile.name}` : "Welcome to CAP";
+    if (state.active === "MyProfile") return "My Profile";
+    if (state.active === "CreatorProfile") return state.viewingCreator?.name || "Creator Profile";
+    return navItems.find(([key]) => key === state.active)?.[1] || "CAP";
+  }
+
+  function render(error = false) {
+    const data = state.data || { creators: [], circles: [], activity: [], collaborations: [], messages: [], stats: {}, profile: null, circleMembership: [] };
+    const profile = data.profile;
+    root.innerHTML = `
+      <div class="app-shell">
+        <aside class="sidebar">
+          <div class="brand-block">
+            <div class="brand-mark logo-mark"><img src="./assets/cap-logo.jpg" alt="CAP logo"></div>
+            <div><strong>CAP</strong><span>Creator Association Platform</span></div>
+          </div>
+          <nav class="nav-list">
+            ${navItems.map(([key, label, icon]) => `<button class="${state.active === key ? "nav-item active" : "nav-item"}" data-nav="${key}"><span>${icon}</span><span>${label}</span></button>`).join("")}
+          </nav>
+          <button class="profile-card profile-card-button" data-my-profile>
+            ${imageWithFallback(profile?.image, "profile-image", profile?.name || "CAP", "avatar founder", initials(profile?.name || "CAP"))}
+            <div class="profile-copy"><strong>${escapeHtml(profile?.name || "Create profile")}</strong><span>${escapeHtml(profile?.role || "Founder")}</span></div>
+            <span class="profile-more">...</span>
+          </button>
+          <div class="mission-card">
+            <strong>CAP Mission</strong>
+            <p>${escapeHtml(profile?.mission || "Set your CAP mission in Settings.")}</p>
+          </div>
+        </aside>
+        <main class="main-content">
+          <header class="topbar">
+            <div><h1>${escapeHtml(pageTitle())}</h1><p>Build together. Grow together.</p></div>
+            <div class="top-actions">
+              <label class="search-box"><span>?</span><input id="global-search" value="${escapeHtml(state.query)}" placeholder="Search creators, skills, circles..."></label>
+              <button class="icon-button" aria-label="Notifications">${iconMap.Bell}</button>
+              <button class="primary-button" data-quick><span>${iconMap.Plus}</span> Quick Action</button>
+            </div>
+          </header>
+          <div class="status-line ${error ? "error" : ""}">${escapeHtml(state.status)}</div>
+          ${view()}
+        </main>
+      </div>`;
+    bindGlobal();
+  }
+
+  function view() {
+    switch (state.active) {
+      case "Directory": return directoryView();
+      case "Circles": return circlesView();
+      case "Discovery": return discoveryView(true);
+      case "Collaborations": return collaborationsView();
+      case "Messages": return messagesView();
+      case "MyProfile": return myProfileView();
+      case "CreatorProfile": return creatorProfileView();
+      case "Settings": return settingsView();
+      default: return homeView();
+    }
+  }
+
+  function stat(icon, value, label) {
+    return `<article class="stat-card"><div class="stat-icon">${icon}</div><div><strong>${Number(value || 0)}</strong><span>${label}</span></div></article>`;
+  }
+
+  function panelHeader(title, action, nav) {
+    return `<div class="panel-header"><h2>${title}</h2>${action ? `<button data-nav="${nav || ""}">${action}</button>` : ""}</div>`;
+  }
+
+  function homeView() {
+    const data = state.data;
+    return `
+      <section class="stats-grid">
+        ${stat(iconMap.Users, data.stats.circleCreators, "Creators in Your Circles")}
+        ${stat(iconMap.Handshake, data.stats.activeCollaborations, "Active Collaborations")}
+        ${stat(iconMap.Sparkles, data.stats.savedCreators, "Saved Creators")}
+        ${stat(iconMap.Star, data.stats.contributionPoints, "Contribution Points")}
+      </section>
+      <section class="dashboard-grid">
+        <div class="panel circles-panel">
+          ${panelHeader("Your Circles", "View All Circles", "Circles")}
+          ${circleList(data.circles.slice(0, 4))}
+        </div>
+        <div class="panel discovery-panel">
+          ${panelHeader("Discovery Queue", "View Full Queue", "Discovery")}
+          ${discoveryCard()}
+        </div>
+        <div class="panel activity-panel">
+          ${panelHeader("Community Activity", "View All", "Settings")}
+          ${activityList(data.activity.slice(0, 6))}
+        </div>
+        <div class="panel projects-panel">
+          ${panelHeader("Recent Collaborations", "View All Projects", "Collaborations")}
+          ${projectGrid(data.collaborations.slice(0, 3))}
+        </div>
+      </section>
+      <section class="homepage-flow">
+        <div class="panel welcome-panel">${welcomePanel()}</div>
+        <div class="panel">${panelHeader("Today's Opportunities", "")}${opportunitiesView()}</div>
+        <div class="panel">${panelHeader("Continue Where You Left Off", "")}${continueView()}</div>
+        <div class="panel featured-home">${panelHeader("Featured Creator", "")}${featuredCreatorView()}</div>
+        <div class="panel">${panelHeader("Community Activity", "")}${activityList(data.activity.slice(0, 8))}</div>
+        <div class="panel radar-home">${panelHeader("Creator Radar", "")}${radarView()}</div>
+      </section>`;
+  }
+
+  function welcomeMatchGroup(title, items, renderItem) {
+    if (!items.length) return "";
+    return `<div class="welcome-group"><h3>${escapeHtml(title)}</h3><div class="pill-row">${items.map(renderItem).join("")}</div></div>`;
+  }
+
+  function welcomePanel() {
+    const matches = getWelcomeMatches();
+    const body = matches.hasMatches
+      ? `
+        <div class="welcome-groups">
+          ${welcomeMatchGroup("Creators matching your niche", matches.creatorMatches, (item) => `<button class="mini-pill" data-view-profile="${item.creator.id}">${escapeHtml(item.creator.name)}</button>`)}
+          ${matches.areaEnabled ? welcomeMatchGroup("Creators in your area", matches.areaMatches, (item) => `<button class="mini-pill" data-view-profile="${item.creator.id}">${escapeHtml(item.creator.name)}</button>`) : ""}
+          ${welcomeMatchGroup("Active collaboration opportunities", matches.activeCollaborations, (item) => `<button class="mini-pill" data-nav="Collaborations">${escapeHtml(item.title)}</button>`)}
+          ${welcomeMatchGroup("Relevant Growth Circles", matches.relevantCircles, (item) => `<button class="mini-pill" data-nav="Circles">${escapeHtml(item.name)}</button>`)}
+          ${welcomeMatchGroup("Creators seeking your skills", matches.skillSeekers, (item) => `<button class="mini-pill" data-view-profile="${item.creator.id}">${escapeHtml(item.creator.name)}</button>`)}
+        </div>`
+      : `<p class="empty-copy welcome-empty">CAP will begin matching creators, opportunities, and communities as real member profiles, circles, and collaboration records grow.</p>`;
+
+    return `
+      <div class="welcome-copy">
+        <h2>You're no longer building alone.</h2>
+        <p>Welcome to CAP. We've already found creators, opportunities, and communities that match your interests.</p>
+      </div>
+      ${body}
+      <div class="form-actions welcome-actions"><button class="primary-button" data-find-first-circle>Find My First Circle</button></div>`;
+  }
+
+  function opportunitiesView() {
+    const items = getOpportunities();
+    if (!items.length) return `<p class="empty-copy">No live opportunities yet. CAP will show active requests, creators seeking support, new projects, and circles needing members once those records exist.</p>`;
+    return `<div class="records-list">${items.map((item) => `<article class="record-card"><header><h3>${escapeHtml(item.title)}</h3><span class="mini-pill">${escapeHtml(item.type)}</span></header><p>${escapeHtml(item.text)}</p><div class="inline-buttons">${item.creatorId ? `<button class="secondary-button" data-view-profile="${item.creatorId}">View Profile</button><button class="secondary-button" data-work="${item.creatorId}">Let's Work Together</button>` : `<button class="secondary-button" data-nav="${item.nav}">Open</button>`}</div></article>`).join("")}</div>`;
+  }
+
+  function continueView() {
+    const last = safeJson(state.data.settings.lastActivity, null);
+    if (last?.type) {
+      return `<div class="records-list"><article class="record-card"><header><h3>${escapeHtml(last.label || "Recent item")}</h3><span class="mini-pill">${escapeHtml(last.type)}</span></header><p>Last touched ${escapeHtml(last.at ? relativeTime(last.at.replace("T", " ").replace("Z", "")) : "recently")}.</p><button class="secondary-button" data-continue-type="${escapeHtml(last.type)}" data-continue-id="${Number(last.id || 0)}">Continue</button></article></div>`;
+    }
+    const tasks = [];
+    if (!state.data.profile) tasks.push({ title: "Create your profile", text: "Finish your identity, links, interests, and member profile.", nav: "MyProfile" });
+    if (!state.data.creators.length) tasks.push({ title: "Publish your creator profile", text: "Creator records power discovery, radar, and opportunities.", nav: "MyProfile" });
+    if (!state.data.circles.length) tasks.push({ title: "Create a creator circle", text: "Circles organize collaboration and membership.", nav: "Circles" });
+    if (!tasks.length) return `<p class="empty-copy">No unfinished setup task or recent activity yet. Your next real action will appear here.</p>`;
+    return `<div class="records-list">${tasks.map((task) => `<article class="record-card"><header><h3>${escapeHtml(task.title)}</h3><span class="mini-pill">setup</span></header><p>${escapeHtml(task.text)}</p><button class="secondary-button" data-nav="${task.nav}">Continue</button></article>`).join("")}</div>`;
+  }
+
+  function safeJson(value, fallback) {
+    try {
+      return value ? JSON.parse(value) : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  function featuredCreatorView() {
+    const creator = getFeaturedCreator();
+    if (!creator) return `<p class="empty-copy">No featured creator yet. Add real creators with profile details, platform links, and videos to activate this card.</p>`;
+    const video = creator.videos?.[0];
+    return `<div class="records-list"><article class="record-card">
+      <div class="record-main">
+        ${imageWithFallback(creator.image, "directory-avatar", creator.name, "directory-avatar placeholder", initials(creator.name))}
+        <div><h3>${escapeHtml(creator.name)}</h3><p>${escapeHtml(creator.role || creator.category || "Creator")}</p><small>${escapeHtml(creator.handle || "")}</small></div>
+      </div>
+      <p>${escapeHtml(creator.description || "No description entered yet.")}</p>
+      <div class="pill-row"><span class="mini-pill">profile ${profileCompleteness(creator)}/9</span>${creator.saved ? `<span class="mini-pill">saved</span>` : ""}</div>
+      <div class="inline-buttons">
+        ${video ? `<button class="watch-button" data-open="${escapeHtml(video.url)}">${iconMap.Play} Watch</button>` : ""}
+        <button class="secondary-button" data-support="${creator.id}">Support</button>
+        <button class="secondary-button" data-save="${creator.id}">${creator.saved ? "Saved" : "Save"}</button>
+        <button class="secondary-button" data-view-profile="${creator.id}">View Profile</button>
+        <button class="secondary-button" data-work="${creator.id}">Let's Work Together</button>
+      </div>
+    </article></div>`;
+  }
+
+  function radarView() {
+    const matches = getRadarMatches();
+    if (!matches.length) return `<p class="empty-copy">No radar matches yet. Add your skills, interests, location, platforms, categories, and collaboration needs in Settings, then add real creators, circles, or collaboration requests.</p>`;
+    return `<div class="records-list">${matches.map((match) => `<article class="record-card"><header><h3>${escapeHtml(match.title)}</h3><span class="mini-pill">${escapeHtml(match.kind)}</span></header><p>${escapeHtml(match.text || "Matched CAP record.")}</p><div class="pill-row">${match.hits.map((hit) => `<span class="mini-pill">${escapeHtml(hit)}</span>`).join("")}</div><div class="inline-buttons">${match.creatorId ? `<button class="secondary-button" data-view-profile="${match.creatorId}">View Profile</button><button class="secondary-button" data-work="${match.creatorId}">Let's Work Together</button>` : `<button class="secondary-button" data-nav="${match.nav}">Open</button>`}</div></article>`).join("")}</div>`;
+  }
+
+  function circleList(circles) {
+    if (!circles.length) return `<p class="empty-copy">No creator circles yet. Create a circle to start grouping creators by community, topic, or collaboration goal.</p>`;
+    return `<div class="circle-list">${circles.map((circle) => `
+      <article class="circle-row">
+        <div class="circle-icon ${escapeHtml(circle.accent || "violet")}">U</div>
+        <div class="circle-copy"><strong>${escapeHtml(circle.name)}</strong><span>${Number(circle.members || 0)} members - ${escapeHtml(circle.detail || "No description yet")}</span></div>
+        <button class="secondary-button" data-nav="Circles">Open</button>
+      </article>`).join("")}</div>`;
+  }
+
+  function discoveryCard() {
+    const creators = filteredCreators();
+    if (!creators.length) return `<p class="empty-copy">No creators in the discovery queue yet. Add creators in the Directory to browse, save, watch, and collaborate.</p>`;
+    const creator = creators[state.discoveryIndex % creators.length];
+    const video = creator.videos?.[0];
+    return `
+      <div class="discovery-media-card" data-view-profile="${creator.id}" role="button" tabindex="0" aria-label="Open ${escapeHtml(creator.name)} profile">
+        <div class="creator-banner ${creator.banner || creator.image ? "" : "placeholder"}">
+          ${coverImage(creator)}
+        </div>
+        <div class="creator-content">
+          ${imageWithFallback(creator.image, "creator-avatar", creator.name, "creator-avatar placeholder", initials(creator.name))}
+          <div><h2>${escapeHtml(creator.name)}</h2><span>${escapeHtml(creator.handle)}</span></div>
+          ${creator.category ? `<span class="category-pill">${escapeHtml(creator.category)}</span>` : ""}
+          <p class="creator-role">${escapeHtml(creator.role || "No role entered")}</p>
+          <p class="creator-description">${escapeHtml(creator.description || "No description entered yet.")}</p>
+          ${platformButtons(creator)}
+          ${video ? embedVideo(video.url) : ""}
+          <div class="creator-buttons">
+            ${video ? `<button class="watch-button" data-open="${escapeHtml(video.url)}">${iconMap.Play} Watch Featured Work</button>` : ""}
+            <button class="secondary-button" data-save="${creator.id}">${creator.saved ? "Saved" : "Save"}</button>
+            <button class="secondary-button" data-work="${creator.id}">Let's Work Together</button>
+            <button class="secondary-button" data-next>Next</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function embedVideo(url) {
+    const youtube = String(url).match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([A-Za-z0-9_-]+)/);
+    if (youtube) return `<iframe class="video-frame" src="https://www.youtube.com/embed/${youtube[1]}" allowfullscreen></iframe>`;
+    const vimeo = String(url).match(/vimeo\.com\/(\d+)/);
+    if (vimeo) return `<iframe class="video-frame" src="https://player.vimeo.com/video/${vimeo[1]}" allowfullscreen></iframe>`;
+    return "";
+  }
+
+  function activityList(items) {
+    if (!items.length) return `<p class="empty-copy">No contribution activity yet. CAP will record creator, circle, message, save, and collaboration actions here.</p>`;
+    return items.map((item) => `<div class="activity-row"><div class="activity-avatar">${escapeHtml(initials(item.actor))}</div><div><strong>${escapeHtml(item.actor)}</strong><span>${escapeHtml(item.action)}${item.points ? ` - ${item.points} pts` : ""}</span></div><time>${escapeHtml(relativeTime(item.created_at))}</time></div>`).join("");
+  }
+
+  function projectGrid(items) {
+    if (!items.length) return `<p class="empty-copy">No collaboration requests yet. Use Discovery or Collaborations to create the first request.</p>`;
+    return `<div class="project-grid">${items.map((item) => `<article class="project-card"><div class="project-icon">W</div><div class="project-title"><strong>${escapeHtml(item.title)}</strong><span>${escapeHtml(item.status)}</span></div><div class="progress-track"><span style="width:${Number(item.progress || 0)}%"></span></div><small>${Number(item.progress || 0)}%</small></article>`).join("")}</div>`;
+  }
+
+  function directoryView() {
+    const creators = filteredCreators();
+    return `<section class="content-grid directory-only">
+      <div class="panel">
+        ${panelHeader("Creator Records", "")}
+        <div class="records-list">
+          ${creators.length ? creators.map(creatorRecord).join("") : `<p class="empty-copy">No registered creator profiles yet. Profiles will appear here after members complete My Profile.</p>`}
+        </div>
+      </div>
+    </section>`;
+  }
+
+  function field(name, label, value, required = false, type = "text") {
+    return `<label class="field"><span>${label}</span><input name="${name}" type="${type}" value="${escapeHtml(value)}" ${required ? "required" : ""}></label>`;
+  }
+
+  function area(name, label, value, extra = "") {
+    return `<label class="field ${extra}"><span>${label}</span><textarea name="${name}">${escapeHtml(value)}</textarea></label>`;
+  }
+
+  function uploadPreview(target, value, label) {
+    const source = imageSrc(value);
+    return `<div class="upload-preview" data-upload-preview="${target}">${source ? `<img src="${escapeHtml(source)}" alt="${escapeHtml(label)}" onerror="this.parentElement.classList.add('missing')">` : `<span>No image selected</span>`}</div>`;
+  }
+
+  function creatorRecord(creator) {
+    return `<article class="record-card">
+      <div class="record-main">
+        ${imageWithFallback(creator.image, "directory-avatar", creator.name, "directory-avatar placeholder", initials(creator.name))}
+        <div><h3>${escapeHtml(creator.name)}</h3><p>${escapeHtml(creator.role || creator.category || "No role entered")}</p><small>${escapeHtml(creator.handle || "")}</small></div>
+      </div>
+      <p>${escapeHtml(creator.description || "No description entered.")}</p>
+      ${platformButtons(creator)}
+      <div class="inline-buttons"><button class="secondary-button" data-view-profile="${creator.id}">View Profile</button><button class="secondary-button" data-save="${creator.id}">${creator.saved ? "Unsave" : "Save"}</button><button class="secondary-button" data-work="${creator.id}">Let's Work Together</button></div>
+    </article>`;
+  }
+
+  function circlesView() {
+    const creators = state.data.creators;
+    return `<section class="content-grid">
+      <div class="panel">${panelHeader("Create Circle", "")}
+        <form id="circle-form" class="form-grid">
+          ${field("name", "Circle name", "", true)}
+          ${field("detail", "Detail", "")}
+          <label class="field"><span>Accent</span><select name="accent"><option>violet</option><option>red</option><option>green</option><option>blue</option></select></label>
+          <div class="form-actions full"><button class="primary-button" type="submit">Create Circle</button></div>
+        </form>
+        <div class="select-row">
+          <label class="field"><span>Add creator to selected circle</span><select id="member-creator">${creators.map((c) => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join("")}</select></label>
+          <button class="secondary-button" data-add-member>Add</button>
+        </div>
+      </div>
+      <div class="panel">${panelHeader("Creator Circles", "")}${circleRecords(filteredCircles())}</div>
+    </section>`;
+  }
+
+  function circleRecords(circles) {
+    if (!circles.length) return `<p class="empty-copy">No circles yet. Create circles to organize creators and track membership.</p>`;
+    const memberships = state.data.circleMembership;
+    return `<div class="records-list">${circles.map((circle) => {
+      const members = memberships.filter((m) => m.circle_id === circle.id);
+      return `<article class="record-card" data-circle="${circle.id}"><header><h3>${escapeHtml(circle.name)}</h3><span class="mini-pill">${Number(circle.members || 0)} members</span></header><p>${escapeHtml(circle.detail || "No description yet.")}</p><div class="pill-row">${members.length ? members.map((m) => `<span class="mini-pill">${escapeHtml(m.creator_name)}</span>`).join("") : `<small>No members yet.</small>`}</div><button class="secondary-button" data-select-circle="${circle.id}">Select</button></article>`;
+    }).join("")}</div>`;
+  }
+
+  function discoveryView(full) {
+    return `<section class="dashboard-grid"><div class="panel discovery-panel" style="grid-column: 1 / span 2">${panelHeader("Discovery Queue", "")}${discoveryCard()}</div><div class="panel activity-panel">${panelHeader("Saved Creators", "")}${savedCreators()}</div></section>`;
+  }
+
+  function savedCreators() {
+    const saved = state.data.creators.filter((creator) => creator.saved);
+    if (!saved.length) return `<p class="empty-copy">No saved creators yet. Save creators from Discovery or the Directory.</p>`;
+    return `<div class="records-list">${saved.map(creatorRecord).join("")}</div>`;
+  }
+
+  function collaborationsView() {
+    return `<section class="content-grid">
+      <div class="panel">${panelHeader("Create Collaboration Request", "")}
+        <form id="collab-form" class="form-grid">
+          ${creatorSelect()}
+          ${field("title", "Project title", "", true)}
+          ${area("message", "Request message", "", "full")}
+          <label class="field"><span>Status</span><select name="status"><option>Requested</option><option>In Progress</option><option>Planning</option><option>Completed</option></select></label>
+          ${field("progress", "Progress", "0", false, "number")}
+          <div class="form-actions full"><button class="primary-button" type="submit">Create Request</button></div>
+        </form>
+      </div>
+      <div class="panel">${panelHeader("Collaboration Records", "")}${collabRecords()}</div>
+    </section>`;
+  }
+
+  function creatorSelect() {
+    return `<label class="field"><span>Creator</span><select name="creatorId"><option value="">No creator selected</option>${state.data.creators.map((c) => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join("")}</select></label>`;
+  }
+
+  function collabRecords() {
+    const items = state.data.collaborations;
+    if (!items.length) return `<p class="empty-copy">No collaboration requests yet. Create one here or use Let's Work Together on a creator.</p>`;
+    return `<div class="records-list">${items.map((item) => `<article class="record-card"><header><h3>${escapeHtml(item.title)}</h3><span class="mini-pill">${escapeHtml(item.status)}</span></header><p>${escapeHtml(item.message || "No message entered.")}</p><small>${escapeHtml(item.creator_name || "No creator")} - ${escapeHtml(relativeTime(item.created_at))}</small><div class="progress-track"><span style="width:${Number(item.progress || 0)}%"></span></div></article>`).join("")}</div>`;
+  }
+
+  function messagesView() {
+    return `<section class="content-grid">
+      <div class="panel">${panelHeader("Send Local Message", "")}
+        <form id="message-form" class="form-grid">
+          ${creatorSelect()}
+          ${field("subject", "Subject", "")}
+          ${area("body", "Message", "", "full")}
+          <div class="form-actions full"><button class="primary-button" type="submit">Send Message</button></div>
+        </form>
+      </div>
+      <div class="panel">${panelHeader("Message Records", "")}${messageRecords()}</div>
+    </section>`;
+  }
+
+  function messageRecords() {
+    const items = state.data.messages;
+    if (!items.length) return `<p class="empty-copy">No local messages yet. Send a message to create the first record.</p>`;
+    return `<div class="records-list">${items.map((item) => `<article class="record-card"><header><h3>${escapeHtml(item.subject || "Untitled message")}</h3><small>${escapeHtml(relativeTime(item.created_at))}</small></header><p class="message-body">${escapeHtml(item.body)}</p><small>${escapeHtml(item.creator_name || "No creator selected")}</small></article>`).join("")}</div>`;
+  }
+
+  function myCreator() {
+    const id = Number(state.data.settings.myCreatorId || 0);
+    return state.data.creators.find((creator) => creator.id === id) || null;
+  }
+
+  function myProfileView() {
+    const p = state.data.profile || {};
+    const mine = myCreator();
+    const platformLines = (mine?.platforms || safeJson(state.data.settings.profilePlatforms, []) || []).map((item) => `${item.platform || ""}|${item.url || ""}`).join("\n");
+    const videoLines = (mine?.videos || safeJson(state.data.settings.profileVideos, []) || []).map((item) => `${item.title || ""}|${item.url || ""}`).join("\n");
+    return `<section class="profile-page">
+      <div class="panel profile-editor-panel">
+        ${panelHeader("My Profile", "")}
+        <form id="my-profile-form" class="form-grid">
+          ${field("name", "Creator name", p.name || mine?.name || "", true)}
+          ${field("handle", "Handle", p.handle || mine?.handle || "")}
+          ${field("role", "Role", p.role || mine?.role || "")}
+          ${field("category", "Category", state.data.settings.category || mine?.category || "")}
+          ${field("image", "Profile image URL or uploaded image", p.image || mine?.image || "")}
+          <label class="field"><span>Upload profile image</span><input type="file" accept="image/png,image/jpeg,image/webp" data-file-target="image">${uploadPreview("image", p.image || mine?.image || "", "Profile image preview")}</label>
+          ${field("banner", "Banner image URL or uploaded image", state.data.settings.banner || mine?.banner || "")}
+          <label class="field"><span>Upload banner image</span><input type="file" accept="image/png,image/jpeg,image/webp" data-file-target="banner">${uploadPreview("banner", state.data.settings.banner || mine?.banner || "", "Banner image preview")}</label>
+          ${area("bio", "Biography", p.bio || mine?.description || "", "full")}
+          ${field("skills", "Skills", state.data.settings.skills || "")}
+          ${field("location", "Location", state.data.settings.location || "")}
+          ${area("platforms", "Platform links, one per line: Platform|URL", platformLines, "full")}
+          ${area("videos", "Featured videos, one per line: Title|URL", videoLines, "full")}
+          ${area("portfolio", "Portfolio", state.data.settings.portfolio || "", "full")}
+          ${area("collaborationInterests", "Collaboration interests", state.data.settings.collaborationInterests || "", "full")}
+          ${area("lookingFor", "What you are looking for", state.data.settings.lookingFor || "", "full")}
+          ${area("mission", "CAP mission", p.mission || "", "full")}
+          <div class="form-actions full"><button class="primary-button" type="submit">Save My Profile</button></div>
+        </form>
+      </div>
+      ${state.data.currentUser?.isAdmin ? adminSection() : ""}
+    </section>`;
+  }
+
+  function adminMetric(title, value, detail) {
+    return `<article class="record-card"><header><h3>${escapeHtml(title)}</h3><span class="mini-pill">${escapeHtml(value)}</span></header><p>${escapeHtml(detail)}</p></article>`;
+  }
+
+  function adminSection() {
+    const admin = state.data.admin || {};
+    return `<div class="panel admin-panel">
+      ${panelHeader("Admin", "")}
+      <div class="admin-grid">
+        <div>
+          <h3>User Management</h3>
+          ${adminMetric("Founder profile", admin.users?.founderProfileComplete ? "complete" : "incomplete", "Local founder account authorization and profile status.")}
+          ${adminMetric("Creator profiles", admin.users?.creatorProfiles || 0, "Registered creator profiles published from member profile records.")}
+          ${adminMetric("Saved creators", admin.users?.savedCreators || 0, "Creator profiles saved by the current account.")}
+        </div>
+        <div>
+          <h3>Reports</h3>
+          ${adminMetric("Activity events", admin.reports?.activityEvents || 0, "Recorded database activity events.")}
+          ${adminMetric("Messages", admin.reports?.messages || 0, "Local message records.")}
+          ${adminMetric("Collaboration requests", admin.reports?.collaborationRequests || 0, "Collaboration request records.")}
+        </div>
+        <div>
+          <h3>Moderation</h3>
+          ${adminMetric("Missing images", admin.moderation?.creatorsMissingImages || 0, "Creator profiles missing profile or banner images.")}
+          ${adminMetric("Missing descriptions", admin.moderation?.creatorsMissingDescriptions || 0, "Creator profiles missing biography/description content.")}
+          ${adminMetric("Open collaborations", admin.moderation?.openCollaborations || 0, "Collaboration requests not marked completed.")}
+        </div>
+        <div>
+          <h3>Analytics</h3>
+          ${adminMetric("Circles", admin.analytics?.circles || 0, "Creator circle records.")}
+          ${adminMetric("Memberships", admin.analytics?.circleMemberships || 0, "Circle membership records.")}
+          ${adminMetric("Contribution points", admin.analytics?.contributionPoints || 0, "Total points generated by real activity.")}
+        </div>
+        <div>
+          <h3>Platform Settings</h3>
+          <form id="admin-settings-form" class="form-grid compact-form">
+            ${field("workspaceName", "Workspace name", state.data.settings.workspaceName || "CAP")}
+            ${area("notes", "Admin notes", state.data.settings.notes || "", "full")}
+            <div class="form-actions full"><button class="secondary-button" type="submit">Save Platform Settings</button></div>
+          </form>
+        </div>
+        <div>
+          <h3>System Health</h3>
+          ${adminMetric("Database", admin.systemHealth?.status || "Unknown", admin.systemHealth?.databasePath || "")}
+          ${adminMetric("Runtime", "local", "CAP is running from the local Node and SQLite desktop launcher.")}
+        </div>
+      </div>
+    </div>`;
+  }
+
+  function splitProfileItems(value) {
+    return String(value || "").split(/[\n,|]/).map((item) => item.trim()).filter(Boolean);
+  }
+
+  function profileTextSection(title, value, empty) {
+    const text = String(value || "").trim();
+    return `<section class="profile-section"><h3>${escapeHtml(title)}</h3>${text ? `<p>${escapeHtml(text)}</p>` : `<p class="empty-copy slim">${escapeHtml(empty)}</p>`}</section>`;
+  }
+
+  function profilePillSection(title, value, empty) {
+    const items = splitProfileItems(value);
+    return `<section class="profile-section"><h3>${escapeHtml(title)}</h3>${items.length ? `<div class="pill-row">${items.map((item) => `<span class="mini-pill">${escapeHtml(item)}</span>`).join("")}</div>` : `<p class="empty-copy slim">${escapeHtml(empty)}</p>`}</section>`;
+  }
+
+  function profilePortfolioSection(creator) {
+    const lines = String(creator.portfolio || "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+    if (!lines.length) return `<section class="profile-section"><h3>Portfolio</h3><p class="empty-copy slim">No portfolio items added yet.</p></section>`;
+    return `<section class="profile-section"><h3>Portfolio</h3><div class="records-list compact-records">${lines.map((line) => {
+      const isUrl = /^https?:\/\//i.test(line);
+      return `<article class="record-card"><p>${escapeHtml(line)}</p>${isUrl ? `<button class="secondary-button" data-open="${escapeHtml(line)}">Open</button>` : ""}</article>`;
+    }).join("")}</div></section>`;
+  }
+
+  function profileVideoSection(creator) {
+    const videos = creator.videos || [];
+    if (!videos.length) return `<section class="profile-section"><h3>Featured Videos</h3><p class="empty-copy slim">No featured videos added yet.</p></section>`;
+    return `<section class="profile-section full-span"><h3>Featured Videos</h3><div class="profile-video-grid">${videos.map((video) => `<article class="record-card profile-video-card"><h4>${escapeHtml(video.title || "Featured video")}</h4>${embedVideo(video.url) || `<button class="watch-button" data-open="${escapeHtml(video.url)}">${iconMap.Play} Watch</button>`}</article>`).join("")}</div></section>`;
+  }
+
+  function profileCircleSection(creator) {
+    const circles = creator.circles || state.data.circleMembership.filter((item) => item.creator_id === creator.id).map((item) => state.data.circles.find((circle) => circle.id === item.circle_id)).filter(Boolean);
+    if (!circles.length) return `<section class="profile-section"><h3>Circles</h3><p class="empty-copy slim">This creator has not joined any circles yet.</p></section>`;
+    return `<section class="profile-section"><h3>Circles</h3><div class="records-list compact-records">${circles.map((circle) => `<article class="record-card"><header><h4>${escapeHtml(circle.name)}</h4><span class="mini-pill">${Number(circle.members || 0)} members</span></header><p>${escapeHtml(circle.detail || "No circle description yet.")}</p><button class="secondary-button" data-nav="Circles">Open Circle</button></article>`).join("")}</div></section>`;
+  }
+
+  function profileProjectSection(creator) {
+    const projects = creator.projects || state.data.collaborations.filter((item) => item.creator_id === creator.id);
+    if (!projects.length) return `<section class="profile-section"><h3>Projects</h3><p class="empty-copy slim">No collaboration projects connected to this creator yet.</p></section>`;
+    return `<section class="profile-section"><h3>Projects</h3><div class="records-list compact-records">${projects.map((project) => `<article class="record-card"><header><h4>${escapeHtml(project.title)}</h4><span class="mini-pill">${escapeHtml(project.status || "Requested")}</span></header><p>${escapeHtml(project.message || "No project details added yet.")}</p><div class="progress-track"><span style="width:${Number(project.progress || 0)}%"></span></div></article>`).join("")}</div></section>`;
+  }
+
+  function creatorProfileView() {
+    const creator = state.viewingCreator;
+    if (!creator) return `<section class="empty-page"><div class="empty-icon">!</div><h2>Creator not found</h2><p>Select a creator from the Directory or Discovery queue.</p><button class="primary-button" data-nav="Directory">Back to Directory</button></section>`;
+    const video = creator.videos?.[0];
+    return `<section class="profile-page public-profile-page">
+      <div class="panel">
+        ${panelHeader("Creator Profile", "Back to Directory", "Directory")}
+        <div class="public-profile-hero">
+          <div class="creator-banner ${creator.banner || creator.image ? "" : "placeholder"}">${coverImage(creator)}</div>
+          <div class="public-profile-identity">
+            ${imageWithFallback(creator.image, "creator-avatar", creator.name, "creator-avatar placeholder", initials(creator.name))}
+            <div class="public-profile-title">
+              <h2>${escapeHtml(creator.name)}</h2>
+              <span>${escapeHtml(creator.handle || "")}</span>
+              <div class="pill-row">${creator.category ? `<span class="category-pill">${escapeHtml(creator.category)}</span>` : ""}${creator.role ? `<span class="mini-pill">${escapeHtml(creator.role)}</span>` : ""}${creator.location ? `<span class="mini-pill">${escapeHtml(creator.location)}</span>` : ""}</div>
+            </div>
+          </div>
+        </div>
+        <div class="public-profile-actions">
+          ${video ? `<button class="watch-button" data-open="${escapeHtml(video.url)}">${iconMap.Play} Watch</button>` : ""}
+          <button class="secondary-button" data-support="${creator.id}">Support</button>
+          <button class="secondary-button" data-save="${creator.id}">${creator.saved ? "Saved" : "Save"}</button>
+          <button class="secondary-button" data-work="${creator.id}">Let's Work Together</button>
+        </div>
+        <div class="public-profile-grid">
+          ${profileTextSection("Biography", creator.description, "No biography added yet.")}
+          ${profilePillSection("Skills", creator.skills, "No skills added yet.")}
+          ${profileTextSection("Location", creator.location, "No location added yet.")}
+          <section class="profile-section"><h3>Platforms</h3>${platformButtons(creator)}</section>
+          ${profileVideoSection(creator)}
+          ${profilePortfolioSection(creator)}
+          ${profileTextSection("Collaboration Interests", creator.collaboration_interests, "No collaboration interests added yet.")}
+          ${profileTextSection("Looking For", creator.looking_for, "No collaboration needs added yet.")}
+          ${profileCircleSection(creator)}
+          ${profileProjectSection(creator)}
+        </div>
+      </div>
+    </section>`;
+  }
+
+  function settingsView() {
+    return `<section class="content-grid">
+      <div class="panel">${panelHeader("Application Settings", "")}
+        <form id="settings-form" class="form-grid">
+          ${field("workspaceName", "Workspace name", state.data.settings.workspaceName || "CAP")}
+          ${area("notes", "Local notes", state.data.settings.notes || "", "full")}
+          <div class="form-actions full"><button class="primary-button" type="submit">Save Settings</button></div>
+        </form>
+      </div>
+    </section>`;
+  }
+
+  function parsePairs(value, secondKey) {
+    return String(value || "").split(/\r?\n/).map((line) => {
+      const [first, ...rest] = line.split("|");
+      return secondKey === "url" ? { platform: (first || "").trim(), url: rest.join("|").trim() } : { title: (first || "").trim(), url: rest.join("|").trim() };
+    }).filter((item) => item.url || item.platform || item.title);
+  }
+
+  function formData(form) {
+    return Object.fromEntries(new FormData(form).entries());
+  }
+
+  function readFile(input) {
+    return new Promise((resolve) => {
+      const file = input.files?.[0];
+      if (!file) return resolve("");
+      const reader = new FileReader();
+      reader.onload = () => resolve({ file, data: reader.result });
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function uploadSelectedImage(input) {
+    const selected = await readFile(input);
+    if (!selected) return "";
+    const result = await api("/api/uploads", {
+      method: "POST",
+      body: JSON.stringify({
+        name: selected.file.name,
+        type: selected.file.type,
+        data: selected.data
+      })
+    });
+    return result.path;
+  }
+
+  async function applyUploads(form, payload) {
+    for (const input of form.querySelectorAll("[data-file-target]")) {
+      try {
+        const storedPath = await uploadSelectedImage(input);
+        if (storedPath) payload[input.dataset.fileTarget] = storedPath;
+      } catch (error) {
+        throw new Error(`Image upload failed: ${error.message}`);
+      }
+    }
+  }
+
+  function isValidImageReference(value) {
+    const source = String(value || "").trim();
+    if (!source) return true;
+    if (source.startsWith("data/uploads/")) return true;
+    if (/^https?:\/\//i.test(source)) {
+      try {
+        new URL(source);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  function validateImageReferences(payload) {
+    if (!isValidImageReference(payload.image)) throw new Error("Profile Image URL must be a valid http or https URL, or choose an upload file instead.");
+    if (!isValidImageReference(payload.banner)) throw new Error("Banner Image URL must be a valid http or https URL, or choose an upload file instead.");
+  }
+
+  function bindUploadPreviews() {
+    root.querySelectorAll("[data-file-target]").forEach((input) => {
+      input.addEventListener("change", async () => {
+        const file = input.files?.[0];
+        const target = input.dataset.fileTarget;
+        const preview = root.querySelector(`[data-upload-preview="${target}"]`);
+        const textInput = root.querySelector(`input[name="${target}"]`);
+        if (!preview || !file) return;
+        if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) {
+          preview.innerHTML = `<span>Choose a PNG, JPG, JPEG, or WebP image.</span>`;
+          preview.classList.add("missing");
+          input.value = "";
+          return;
+        }
+        const selected = await readFile(input);
+        preview.classList.remove("missing");
+        preview.innerHTML = `<img src="${escapeHtml(selected.data)}" alt="Selected image preview">`;
+        if (textInput) textInput.value = file.name;
+      });
+    });
+  }
+
+  function bindGlobal() {
+    root.querySelectorAll("[data-nav]").forEach((button) => button.addEventListener("click", () => { state.active = button.dataset.nav; state.status = ""; render(); }));
+    root.querySelector("[data-my-profile]")?.addEventListener("click", () => { state.active = "MyProfile"; state.status = ""; render(); });
+    root.querySelector("#global-search")?.addEventListener("input", (event) => { state.query = event.target.value; render(); });
+    root.querySelector("[data-quick]")?.addEventListener("click", () => { state.active = "MyProfile"; state.status = ""; render(); });
+    root.querySelector("[data-find-first-circle]")?.addEventListener("click", () => {
+      state.active = "Circles";
+      const matches = getWelcomeMatches();
+      if (matches.relevantCircles[0]) state.selectedCircle = matches.relevantCircles[0].id;
+      state.status = "";
+      render();
+    });
+    root.querySelector("[data-next]")?.addEventListener("click", (event) => { event.stopPropagation(); state.discoveryIndex += 1; render(); });
+    root.querySelectorAll("[data-open]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); window.open(button.dataset.open, "_blank"); }));
+    root.querySelectorAll("[data-save]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); submit("/api/saved", { creatorId: Number(button.dataset.save) }); }));
+    root.querySelectorAll("[data-support]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); submit("/api/support", { creatorId: Number(button.dataset.support) }); }));
+    root.querySelectorAll("[data-view-profile]").forEach((button) => button.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      const creatorId = Number(button.dataset.viewProfile);
+      await submit("/api/viewed", { creatorId });
+      state.viewingCreator = state.data.creators.find((item) => item.id === creatorId) || null;
+      state.active = "CreatorProfile";
+      state.status = "";
+      render();
+    }));
+    root.querySelectorAll("[data-continue-type]").forEach((button) => button.addEventListener("click", () => {
+      const type = button.dataset.continueType;
+      const id = Number(button.dataset.continueId);
+      if (type === "creator" || type === "profile") {
+        state.viewingCreator = state.data.creators.find((item) => item.id === id) || null;
+        state.active = type === "profile" ? "MyProfile" : "CreatorProfile";
+      } else if (type === "circle") {
+        state.selectedCircle = id;
+        state.active = "Circles";
+      } else if (type === "collaboration") {
+        state.active = "Collaborations";
+      } else if (type === "message") {
+        state.active = "Messages";
+      } else {
+        state.active = "Settings";
+      }
+      state.status = "";
+      render();
+    }));
+    root.querySelectorAll("[data-work]").forEach((button) => button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const creator = state.data.creators.find((item) => item.id === Number(button.dataset.work));
+      if (!creator) return;
+      submit("/api/collaborations", { creatorId: creator.id, title: `Collaboration with ${creator.name}`, message: "Let's work together.", status: "Requested", progress: 0 });
+    }));
+    root.querySelectorAll("[data-select-circle]").forEach((button) => button.addEventListener("click", () => { state.selectedCircle = Number(button.dataset.selectCircle); state.status = "Circle selected."; render(); }));
+    root.querySelector("[data-add-member]")?.addEventListener("click", () => {
+      const circleId = state.selectedCircle || state.data.circles[0]?.id;
+      const creatorId = Number(root.querySelector("#member-creator")?.value);
+      if (!circleId) { state.status = "Create or select a circle first."; render(true); return; }
+      submit(`/api/circles/${circleId}/members`, { creatorId });
+    });
+    bindUploadPreviews();
+    bindForms();
+  }
+
+  function bindForms() {
+    root.querySelector("#my-profile-form")?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        const form = event.currentTarget;
+        const payload = formData(form);
+        payload.platforms = parsePairs(payload.platforms, "url");
+        payload.videos = parsePairs(payload.videos, "video");
+        payload.platformSearch = payload.platforms.map((item) => item.platform).filter(Boolean).join(", ");
+        await applyUploads(form, payload);
+        validateImageReferences(payload);
+        await submit("/api/my-profile", payload);
+        state.active = "MyProfile";
+      } catch (error) {
+        state.status = error.message;
+        render(true);
+      }
+    });
+    root.querySelector("#circle-form")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      submit("/api/circles", formData(event.currentTarget));
+    });
+    root.querySelector("#collab-form")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      submit("/api/collaborations", formData(event.currentTarget));
+    });
+    root.querySelector("#message-form")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      submit("/api/messages", formData(event.currentTarget));
+    });
+    root.querySelector("#settings-form")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      submit("/api/settings", formData(event.currentTarget));
+    });
+    root.querySelector("#admin-settings-form")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      submit("/api/settings", formData(event.currentTarget));
+    });
+  }
+
+  refresh().catch((error) => {
+    root.innerHTML = `<section class="empty-page"><div class="empty-icon">!</div><h2>CAP could not start</h2><p>${escapeHtml(error.message)}</p></section>`;
+  });
+})();
