@@ -425,14 +425,15 @@ function requireAdmin(user) {
   }
 }
 
-function configuredFounderEmail() {
+function configuredFounderEmail(options = {}) {
+  const { logIfMissing = true } = options;
   const email = normalizeEmail(process.env.CAP_FOUNDER_EMAIL);
   if (!email) {
-    log("Founder account not configured. CAP_FOUNDER_EMAIL is missing.");
+    if (logIfMissing) log("Founder account not configured. CAP_FOUNDER_EMAIL is missing.");
     return "";
   }
   if (!isValidEmail(email)) {
-    log("Founder account not configured. CAP_FOUNDER_EMAIL is invalid.");
+    if (logIfMissing) log("Founder account not configured. CAP_FOUNDER_EMAIL is invalid.");
     return "";
   }
   return email;
@@ -515,9 +516,8 @@ function initializeFounderUser() {
 }
 
 function assertNotFounderRegistrationEmail(email) {
-  const founderEmail = normalizeEmail(process.env.CAP_FOUNDER_EMAIL);
-  if (!founderEmail || !isValidEmail(founderEmail)) return;
-  if (normalizeEmail(email) === founderEmail) {
+  const founderEmail = configuredFounderEmail({ logIfMissing: false });
+  if (founderEmail && normalizeEmail(email) === founderEmail) {
     const error = new Error("The configured founder email cannot be registered publicly.");
     error.status = 409;
     throw error;
@@ -830,6 +830,8 @@ function getDiscoveryQueue(user, force = false) {
     })
     .sort((a, b) => b.score - a.score || new Date(b.updated_at || b.created_at).getTime() - new Date(a.updated_at || a.created_at).getTime());
 
+  // Avoid unbounded growth if many users hit discovery.
+  if (discoveryCache.size > 5000) discoveryCache.delete(discoveryCache.keys().next().value);
   discoveryCache.set(user.id, recommendations);
   return recommendations;
 }
