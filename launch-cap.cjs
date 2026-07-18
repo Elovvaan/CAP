@@ -424,14 +424,15 @@ function requireAdmin(user) {
   }
 }
 
-function configuredFounderEmail() {
+function configuredFounderEmail(options = {}) {
+  const { logIfMissing = true } = options;
   const email = normalizeEmail(process.env.CAP_FOUNDER_EMAIL);
   if (!email) {
-    log("Founder account not configured. CAP_FOUNDER_EMAIL is missing.");
+    if (logIfMissing) log("Founder account not configured. CAP_FOUNDER_EMAIL is missing.");
     return "";
   }
   if (!isValidEmail(email)) {
-    log("Founder account not configured. CAP_FOUNDER_EMAIL is invalid.");
+    if (logIfMissing) log("Founder account not configured. CAP_FOUNDER_EMAIL is invalid.");
     return "";
   }
   return email;
