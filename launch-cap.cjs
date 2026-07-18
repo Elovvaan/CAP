@@ -7,7 +7,6 @@ const { DatabaseSync } = require("node:sqlite");
 
 const root = path.join(__dirname, "dist");
 const isHosted = Boolean(process.env.PORT || process.env.RAILWAY_ENVIRONMENT || process.env.CAP_HOST);
-const trustProxy = Boolean(process.env.CAP_TRUST_PROXY);
 const dataDir = path.resolve(process.env.CAP_DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, "data"));
 const uploadDir = path.join(dataDir, "uploads");
 const dbPath = process.env.CAP_DB_PATH ? path.resolve(process.env.CAP_DB_PATH) : path.join(dataDir, "cap.db");
