@@ -137,6 +137,7 @@ function initializeDatabase() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       creator_id INTEGER NOT NULL REFERENCES creators(id) ON DELETE CASCADE,
       platform TEXT NOT NULL,
+      handle TEXT NOT NULL DEFAULT '',
       url TEXT NOT NULL
     );
 
@@ -264,6 +265,7 @@ function initializeDatabase() {
   addColumnIfMissing("messages", "sender_user_id", "sender_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL");
   addColumnIfMissing("messages", "recipient_user_id", "recipient_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL");
   addColumnIfMissing("contribution_activity", "user_id", "user_id INTEGER REFERENCES users(id) ON DELETE SET NULL");
+  addColumnIfMissing("platform_links", "handle", "handle TEXT NOT NULL DEFAULT ''");
   rebuildSavedCreatorsForUsers();
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_creators_user_id ON creators(user_id);
@@ -706,24 +708,87 @@ function saveUploadedImage(payload) {
   return `data/uploads/${filename}`;
 }
 
-function listFromLines(value) {
-  if (!Array.isArray(value)) return [];
-  return value
-    .map((item) => ({
-      platform: sanitizeText(item.platform),
-      url: sanitizeText(item.url)
-    }))
-    .filter((item) => item.platform || item.url);
+function parseSafeUrl(value, label) {
+  const url = sanitizeText(value);
+  if (!url) throw new Error(`${label} URL is required.`);
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`${label} URL is malformed.`);
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error(`${label} URL must start with http or https.`);
+  }
+  return parsed.toString();
 }
 
-function videosFromLines(value) {
-  if (!Array.isArray(value)) return [];
+function platformFromUrl(url) {
+  const host = (() => {
+    try {
+      return new URL(url).hostname.toLowerCase().replace(/^www\./, "");
+    } catch {
+      return "";
+    }
+  })();
+  if (host.includes("youtube.com") || host.includes("youtu.be")) return "YouTube";
+  if (host.includes("instagram.com")) return "Instagram";
+  if (host.includes("tiktok.com")) return "TikTok";
+  if (host.includes("facebook.com") || host.includes("fb.com")) return "Facebook";
+  if (host.includes("x.com") || host.includes("twitter.com")) return "X";
+  if (host.includes("vimeo.com")) return "Vimeo";
+  if (host.includes("twitch.tv")) return "Twitch";
+  if (host.includes("spotify.com")) return "Spotify";
+  if (host.includes("soundcloud.com")) return "SoundCloud";
+  if (host.includes("linkedin.com")) return "LinkedIn";
+  return "Website";
+}
+
+function inferHandle(platform, url) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    const parts = parsed.pathname.split("/").map((part) => part.trim()).filter(Boolean);
+    if (!parts.length) return "";
+    if (host.includes("youtube.com") && parts[0].startsWith("@")) return parts[0];
+    if (host.includes("instagram.com")) return parts[0] ? `@${parts[0].replace(/^@/, "")}` : "";
+    if (host.includes("tiktok.com")) return parts[0] ? `@${parts[0].replace(/^@/, "")}` : "";
+    if (host.includes("x.com") || host.includes("twitter.com")) return parts[0] ? `@${parts[0].replace(/^@/, "")}` : "";
+    if (host.includes("facebook.com")) return parts[0] || "";
+    if (host.includes("twitch.tv")) return parts[0] || "";
+    if (host.includes("soundcloud.com")) return parts[0] || "";
+    return "";
+  } catch {
+    return "";
+  }
+}
+
+function normalizePlatforms(value) {
+  if (!Array.isArray(value)) throw new Error("Social platforms must be submitted as rows.");
   return value
-    .map((item) => ({
-      title: sanitizeText(item.title),
-      url: sanitizeText(item.url)
-    }))
-    .filter((item) => item.url);
+    .map((item, index) => {
+      const rawPlatform = sanitizeText(item?.platform);
+      const handle = sanitizeText(item?.handle);
+      const rawUrl = sanitizeText(item?.url);
+      if (!rawPlatform && !handle && !rawUrl) return null;
+      const url = parseSafeUrl(rawUrl, `Social platform ${index + 1}`);
+      const platform = rawPlatform || platformFromUrl(url);
+      return { platform, handle: handle || inferHandle(platform, url), url };
+    })
+    .filter(Boolean);
+}
+
+function normalizeVideos(value) {
+  if (!Array.isArray(value)) throw new Error("Featured videos must be submitted as video rows.");
+  return value
+    .map((item, index) => {
+      const title = sanitizeText(item?.title) || "Featured video";
+      const rawUrl = sanitizeText(item?.url);
+      if (!sanitizeText(item?.title) && !rawUrl) return null;
+      const url = parseSafeUrl(rawUrl, `Featured video ${index + 1}`);
+      return { title, url };
+    })
+    .filter(Boolean);
 }
 
 function saveKeyValues(values, user = null) {
@@ -752,8 +817,8 @@ function termMatches(a, b) {
 
 function platformTerms(creator) {
   if (!creator?.id) return "";
-  return all("SELECT platform, url FROM platform_links WHERE creator_id = ? ORDER BY id", [creator.id])
-    .flatMap((item) => [item.platform, item.url])
+  return all("SELECT platform, handle, url FROM platform_links WHERE creator_id = ? ORDER BY id", [creator.id])
+    .flatMap((item) => [item.platform, item.handle, item.url])
     .join(", ");
 }
 
@@ -891,7 +956,7 @@ function creatorWithRelations(row, user = null) {
   if (!row) return null;
   return {
     ...row,
-    platforms: all("SELECT id, platform, url FROM platform_links WHERE creator_id = ? ORDER BY id", [row.id]),
+    platforms: all("SELECT id, platform, handle, url FROM platform_links WHERE creator_id = ? ORDER BY id", [row.id]),
     videos: all("SELECT id, title, url FROM featured_videos WHERE creator_id = ? ORDER BY id", [row.id]),
     circles: all(`
       SELECT c.id, c.name, c.detail, c.accent, m.joined_at
@@ -1098,6 +1163,10 @@ function saveProfile(payload, user = null) {
 }
 
 function saveCreator(payload, id = null, user = null, options = {}) {
+  const hasPlatforms = Object.prototype.hasOwnProperty.call(payload, "platforms");
+  const hasVideos = Object.prototype.hasOwnProperty.call(payload, "videos");
+  const normalizedPlatforms = hasPlatforms ? normalizePlatforms(payload.platforms) : null;
+  const normalizedVideos = hasVideos ? normalizeVideos(payload.videos) : null;
   const values = [
     sanitizeText(payload.name),
     sanitizeText(payload.handle),
@@ -1134,8 +1203,6 @@ function saveCreator(payload, id = null, user = null, options = {}) {
        WHERE id = ?`,
       [...values, creatorId]
     );
-    run("DELETE FROM platform_links WHERE creator_id = ?", [creatorId]);
-    run("DELETE FROM featured_videos WHERE creator_id = ?", [creatorId]);
   } else {
     const result = run(
       `INSERT INTO creators
@@ -1146,11 +1213,17 @@ function saveCreator(payload, id = null, user = null, options = {}) {
     creatorId = Number(result.lastInsertRowid);
   }
 
-  for (const item of listFromLines(payload.platforms)) {
-    run("INSERT INTO platform_links (creator_id, platform, url) VALUES (?, ?, ?)", [creatorId, item.platform, item.url]);
+  if (hasPlatforms || !id) {
+    run("DELETE FROM platform_links WHERE creator_id = ?", [creatorId]);
+    for (const item of normalizedPlatforms || []) {
+      run("INSERT INTO platform_links (creator_id, platform, handle, url) VALUES (?, ?, ?, ?)", [creatorId, item.platform, item.handle, item.url]);
+    }
   }
-  for (const item of videosFromLines(payload.videos)) {
-    run("INSERT INTO featured_videos (creator_id, title, url) VALUES (?, ?, ?)", [creatorId, item.title, item.url]);
+  if (hasVideos || !id) {
+    run("DELETE FROM featured_videos WHERE creator_id = ?", [creatorId]);
+    for (const item of normalizedVideos || []) {
+      run("INSERT INTO featured_videos (creator_id, title, url) VALUES (?, ?, ?)", [creatorId, item.title, item.url]);
+    }
   }
 
   run("INSERT INTO contribution_activity (actor, action, points, user_id) VALUES (?, ?, ?, ?)", [values[0], id ? "updated a creator profile" : "joined the creator directory", id ? 3 : 10, user?.id || null]);
@@ -1201,8 +1274,8 @@ function saveMyProfile(payload, user) {
     portfolio: sanitizeText(payload.portfolio),
     collaborationInterests: sanitizeText(payload.collaborationInterests),
     lookingFor: sanitizeText(payload.lookingFor),
-    platforms: listFromLines(payload.platforms),
-    videos: videosFromLines(payload.videos)
+    platforms: Array.isArray(payload.platforms) ? payload.platforms : [],
+    videos: Array.isArray(payload.videos) ? payload.videos : []
   };
   const creatorId = saveCreator(creatorPayload, existingId || null, user);
   setRecentActivity("profile", creatorId, name, user);

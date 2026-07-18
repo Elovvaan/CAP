@@ -10,6 +10,7 @@
   ];
   const state = { active: "Home", query: "", data: null, viewingCreator: null, discoveryIndex: 0, status: "", authUser: null, authMode: "signin", authReady: false };
   const maxImageBytes = 15 * 1024 * 1024;
+  const socialPlatforms = ["YouTube", "Instagram", "TikTok", "Facebook", "X", "Vimeo", "Twitch", "Spotify", "SoundCloud", "LinkedIn", "Website", "Other"];
   const root = document.getElementById("root");
 
   const iconMap = {
@@ -227,10 +228,35 @@
     return "Platform";
   }
 
+  function inferSocialHandle(item) {
+    const handle = String(item.handle || "").trim();
+    if (handle) return handle;
+    try {
+      const url = new URL(String(item.url || ""));
+      const host = url.hostname.toLowerCase();
+      const first = url.pathname.split("/").map((part) => part.trim()).filter(Boolean)[0] || "";
+      if (!first) return "";
+      if (host.includes("youtube.com") && first.startsWith("@")) return first;
+      if (host.includes("instagram.com") || host.includes("tiktok.com") || host.includes("x.com") || host.includes("twitter.com")) return `@${first.replace(/^@/, "")}`;
+      if (host.includes("facebook.com") || host.includes("twitch.tv") || host.includes("soundcloud.com")) return first;
+      return "";
+    } catch {
+      return "";
+    }
+  }
+
+  function platformDisplay(item) {
+    const label = platformLabel(item);
+    const handle = inferSocialHandle(item);
+    if (handle) return `${label} · ${handle}`;
+    if (["Website", "Other"].includes(label)) return item.url || label;
+    return label;
+  }
+
   function platformButtons(creator) {
     const links = (creator.platforms || []).filter((item) => item.url);
     if (!links.length) return `<p class="platforms">No platform links yet</p>`;
-    return `<div class="platform-buttons">${links.map((item) => `<button class="platform-button" data-open="${escapeHtml(item.url)}">${escapeHtml(platformLabel(item))}</button>`).join("")}</div>`;
+    return `<div class="platform-buttons">${links.map((item) => `<button class="platform-button" data-open="${escapeHtml(item.url)}">${escapeHtml(platformDisplay(item))}</button>`).join("")}</div>`;
   }
 
   function coverImage(creator) {
@@ -624,11 +650,15 @@
   }
 
   function embedVideo(url) {
-    const youtube = String(url).match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([A-Za-z0-9_-]+)/);
-    if (youtube) return `<iframe class="video-frame" src="https://www.youtube.com/embed/${youtube[1]}" allowfullscreen></iframe>`;
+    const youtube = String(url).match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([A-Za-z0-9_-]+)/);
+    if (youtube) return `<iframe class="video-frame" src="https://www.youtube.com/embed/${escapeHtml(youtube[1])}" title="Featured video" loading="lazy" allowfullscreen></iframe>`;
     const vimeo = String(url).match(/vimeo\.com\/(\d+)/);
-    if (vimeo) return `<iframe class="video-frame" src="https://player.vimeo.com/video/${vimeo[1]}" allowfullscreen></iframe>`;
+    if (vimeo) return `<iframe class="video-frame" src="https://player.vimeo.com/video/${escapeHtml(vimeo[1])}" title="Featured video" loading="lazy" allowfullscreen></iframe>`;
     return "";
+  }
+
+  function videoPlatformName(url) {
+    return platformLabel({ url });
   }
 
   function activityList(items) {
@@ -762,15 +792,34 @@
     return `<div class="records-list">${items.map((item) => `<article class="record-card"><header><h3>${escapeHtml(item.subject || "Untitled message")}</h3><small>${escapeHtml(relativeTime(item.created_at))}</small></header><p class="message-body">${escapeHtml(item.body)}</p><small>${escapeHtml(item.creator_name || "No creator selected")}</small></article>`).join("")}</div>`;
   }
 
+  function socialPlatformRow(item = {}) {
+    const platform = platformLabel(item);
+    const handle = inferSocialHandle(item);
+    return `<div class="social-platform-row" data-social-row>
+      <label class="field"><span>Platform</span><select data-social-platform>${socialPlatforms.map((choice) => `<option value="${escapeHtml(choice)}" ${choice === platform ? "selected" : ""}>${escapeHtml(choice)}</option>`).join("")}</select></label>
+      <label class="field"><span>Handle or username</span><input data-social-handle value="${escapeHtml(handle)}"></label>
+      <label class="field"><span>Profile URL</span><input data-social-url value="${escapeHtml(item.url || "")}"></label>
+      <button class="secondary-button social-remove-button" type="button" data-remove-social>Remove</button>
+    </div>`;
+  }
+
+  function socialPlatformEditor(platforms) {
+    const rows = (platforms || []).length ? platforms : [{}];
+    return `<div class="social-platform-editor full">
+      <div class="form-section-heading"><h3>Social Platforms</h3></div>
+      <div data-social-rows>${rows.map(socialPlatformRow).join("")}</div>
+      <div class="form-actions inline-form-actions"><button class="secondary-button" type="button" data-add-social>+ Add Social Platform</button></div>
+    </div>`;
+  }
+
   function myCreator() {
-    const id = Number(state.data.settings.myCreatorId || 0);
-    return state.data.creators.find((creator) => creator.id === id) || null;
+    return state.data?.myCreator || null;
   }
 
   function myProfileView() {
     const p = state.data.profile || {};
     const mine = myCreator();
-    const platformLines = (mine?.platforms || safeJson(state.data.settings.profilePlatforms, []) || []).map((item) => `${item.platform || ""}|${item.url || ""}`).join("\n");
+    const socialRows = mine?.platforms || safeJson(state.data.settings.profilePlatforms, []);
     const videoLines = (mine?.videos || safeJson(state.data.settings.profileVideos, []) || []).map((item) => `${item.title || ""}|${item.url || ""}`).join("\n");
     return `<section class="profile-page">
       <div class="panel profile-editor-panel">
@@ -787,7 +836,7 @@
           ${area("bio", "Biography", p.bio || mine?.description || "", "full")}
           ${field("skills", "Skills", state.data.settings.skills || "")}
           ${field("location", "Location", state.data.settings.location || "")}
-          ${area("platforms", "Platform links, one per line: Platform|URL", platformLines, "full")}
+          ${socialPlatformEditor(socialRows)}
           ${area("videos", "Featured videos, one per line: Title|URL", videoLines, "full")}
           ${area("portfolio", "Portfolio", state.data.settings.portfolio || "", "full")}
           ${area("collaborationInterests", "Collaboration interests", state.data.settings.collaborationInterests || "", "full")}
@@ -884,7 +933,7 @@
   function profileVideoSection(creator) {
     const videos = creator.videos || [];
     if (!videos.length) return `<section class="profile-section"><h3>Featured Videos</h3><p class="empty-copy slim">No featured videos added yet.</p></section>`;
-    return `<section class="profile-section full-span"><h3>Featured Videos</h3><div class="profile-video-grid">${videos.map((video) => `<article class="record-card profile-video-card"><h4>${escapeHtml(video.title || "Featured video")}</h4>${embedVideo(video.url) || `<button class="watch-button" data-open="${escapeHtml(video.url)}">${iconMap.Play} Watch</button>`}</article>`).join("")}</div></section>`;
+    return `<section class="profile-section full-span"><h3>Featured Videos</h3><div class="profile-video-grid">${videos.map((video) => `<article class="record-card profile-video-card"><h4>${escapeHtml(video.title || "Featured video")}</h4>${embedVideo(video.url) || `<div class="video-link-card"><span>${escapeHtml(videoPlatformName(video.url))}</span><button class="watch-button" data-open="${escapeHtml(video.url)}">${iconMap.Play} Watch</button></div>`}</article>`).join("")}</div></section>`;
   }
 
   function profileCircleSection(creator) {
@@ -990,11 +1039,19 @@
     </section>`;
   }
 
-  function parsePairs(value, secondKey) {
+  function parseVideoLines(value) {
     return String(value || "").split(/\r?\n/).map((line) => {
       const [first, ...rest] = line.split("|");
-      return secondKey === "url" ? { platform: (first || "").trim(), url: rest.join("|").trim() } : { title: (first || "").trim(), url: rest.join("|").trim() };
-    }).filter((item) => item.url || item.platform || item.title);
+      return { title: (first || "").trim(), url: rest.join("|").trim() };
+    }).filter((item) => item.url || item.title);
+  }
+
+  function collectSocialPlatforms(form) {
+    return [...form.querySelectorAll("[data-social-row]")].map((row) => ({
+      platform: row.querySelector("[data-social-platform]")?.value || "",
+      handle: row.querySelector("[data-social-handle]")?.value || "",
+      url: row.querySelector("[data-social-url]")?.value || ""
+    })).filter((item) => item.platform || item.handle || item.url);
   }
 
   function formData(form) {
@@ -1124,7 +1181,11 @@
       }
       render();
     });
-    root.querySelectorAll("[data-open]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); window.open(button.dataset.open, "_blank"); }));
+    root.querySelectorAll("[data-open]").forEach((button) => button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const opened = window.open(button.dataset.open, "_blank", "noopener,noreferrer");
+      if (opened) opened.opener = null;
+    }));
     root.querySelectorAll("[data-save]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); submit("/api/saved", { creatorId: Number(button.dataset.save) }); }));
     root.querySelectorAll("[data-follow]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); submit("/api/follow", { creatorId: Number(button.dataset.follow) }); }));
     root.querySelectorAll("[data-hide]").forEach((button) => button.addEventListener("click", async (event) => {
@@ -1174,6 +1235,16 @@
       if (!creator) return;
       submit("/api/collaborations", { creatorId: creator.id, title: `Collaboration with ${creator.name}`, message: "Let's work together.", status: "Requested", progress: 0 });
     }));
+    root.querySelector("[data-add-social]")?.addEventListener("click", () => {
+      const rows = root.querySelector("[data-social-rows]");
+      if (rows) rows.insertAdjacentHTML("beforeend", socialPlatformRow({ platform: "YouTube", handle: "", url: "" }));
+    });
+    root.querySelector("[data-social-rows]")?.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-remove-social]");
+      if (!button) return;
+      const row = button.closest("[data-social-row]");
+      if (row) row.remove();
+    });
     root.querySelectorAll("[data-select-circle]").forEach((button) => button.addEventListener("click", () => { state.selectedCircle = Number(button.dataset.selectCircle); state.status = "Circle selected."; render(); }));
     root.querySelector("[data-add-member]")?.addEventListener("click", () => {
       const circleId = state.selectedCircle || state.data.circles[0]?.id;
@@ -1191,9 +1262,9 @@
       try {
         const form = event.currentTarget;
         const payload = formData(form);
-        payload.platforms = parsePairs(payload.platforms, "url");
-        payload.videos = parsePairs(payload.videos, "video");
-        payload.platformSearch = payload.platforms.map((item) => item.platform).filter(Boolean).join(", ");
+        payload.platforms = collectSocialPlatforms(form);
+        payload.videos = parseVideoLines(payload.videos);
+        payload.platformSearch = payload.platforms.map((item) => `${item.platform} ${item.handle}`.trim()).filter(Boolean).join(", ");
         await applyUploads(form, payload);
         validateImageReferences(payload);
         await submit("/api/my-profile", payload);
