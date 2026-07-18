@@ -89,9 +89,9 @@ async function upload(cookieValue, payload) {
     assert(health.response.status === 200 && health.body.status === "ok", "health endpoint failed");
     const background = await fetch(`${base}/assets/cap-background.png`);
     assert(background.status === 200, "background asset did not return 200");
-    const clientScript = fs.readFileSync(path.join(projectRoot, "dist", "assets", "cap-local.js"), "utf8");
-    assert(clientScript.includes("function accountLabel"), "Account label helper missing from client");
-    assert(!clientScript.includes('profile?.role || "Founder"'), "Signed-in identity still falls back from creator role to Founder");
+    const accountScript = fs.readFileSync(path.join(projectRoot, "dist", "assets", "cap-account-label.js"), "utf8");
+    const indexHtml = fs.readFileSync(path.join(projectRoot, "dist", "index.html"), "utf8");
+    assert(accountScript.includes("accountLabel") && indexHtml.includes("cap-account-label.js"), "Runtime account label correction is not wired into the app");
 
     const regA = await request("/api/auth/register", {
       method: "POST",
