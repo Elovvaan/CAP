@@ -11,7 +11,8 @@ const trustProxy = Boolean(process.env.CAP_TRUST_PROXY);
 const dataDir = path.resolve(process.env.CAP_DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, "data"));
 const uploadDir = path.join(dataDir, "uploads");
 const dbPath = process.env.CAP_DB_PATH ? path.resolve(process.env.CAP_DB_PATH) : path.join(dataDir, "cap.db");
-const host = process.env.CAP_HOST || (isHosted ? "0.0.0.0" : "127.0.0.1");
+const requestedHost = process.env.CAP_HOST || "";
+const host = isHosted ? "0.0.0.0" : (requestedHost || "127.0.0.1");
 const preferredPort = Number(process.env.PORT || process.env.CAP_PORT || 1420);
 const logPath = process.env.CAP_LOG_PATH || (isHosted ? path.join(dataDir, "cap-launch.log") : path.join(__dirname, "cap-launch.log"));
 const sessionCookieName = "cap_session";
@@ -23,6 +24,12 @@ const authLimitWindowMs = 15 * 60 * 1000;
 const authLimitMax = 20;
 const authAttempts = new Map();
 const discoveryCache = new Map();
+const startupState = {
+  ready: false,
+  initializing: false,
+  error: "",
+  startedAt: new Date().toISOString()
+};
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -37,9 +44,7 @@ const mimeTypes = {
   ".ico": "image/x-icon"
 };
 
-fs.mkdirSync(dataDir, { recursive: true });
-fs.mkdirSync(uploadDir, { recursive: true });
-const db = new DatabaseSync(dbPath);
+let db = null;
 
 function log(message) {
   try {
@@ -77,6 +82,33 @@ function addColumnIfMissing(table, name, ddl) {
     backupDatabaseIfNeeded(`adding ${table}.${name}`);
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
   }
+}
+
+function initializeRuntime() {
+  if (startupState.ready || startupState.initializing) return;
+  startupState.initializing = true;
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.mkdirSync(uploadDir, { recursive: true });
+    db = new DatabaseSync(dbPath);
+    initializeDatabase();
+    startupState.ready = true;
+    startupState.error = "";
+    log(`CAP startup complete. SQLite database initialized at ${dbPath}`);
+  } catch (error) {
+    startupState.ready = false;
+    startupState.error = error.message || "Startup failed.";
+    log(`CAP startup failed: ${error.stack || error.message}`);
+  } finally {
+    startupState.initializing = false;
+  }
+}
+
+function requireRuntimeReady() {
+  if (startupState.ready && db) return;
+  const error = new Error(startupState.error ? `CAP startup failed: ${startupState.error}` : "CAP is still starting.");
+  error.status = startupState.error ? 503 : 503;
+  throw error;
 }
 
 function rebuildSavedCreatorsForUsers() {
@@ -1611,6 +1643,7 @@ async function updateAccount(payload, user) {
 
 async function handleApi(request, response, url) {
   try {
+    requireRuntimeReady();
     const authResult = await handleAuth(request, response, url);
     if (authResult !== null) return authResult;
 
@@ -2085,15 +2118,17 @@ function openBrowser(port) {
 }
 
 function startServer(port) {
-  initializeDatabase();
-  log(`Starting CAP from ${root} with SQLite database ${dbPath}`);
-
   const server = http.createServer((request, response) => {
     const url = new URL(request.url || "/", `http://${host}:${port}`);
     if (request.method === "GET" && url.pathname === "/health") {
       return json(response, 200, {
         status: "ok",
-        service: "CAP"
+        service: "CAP",
+        ready: startupState.ready,
+        initializing: startupState.initializing,
+        startupError: startupState.error ? "startup failed; see server logs" : "",
+        host,
+        port
       });
     }
     if (url.pathname.startsWith("/api/")) {
@@ -2101,6 +2136,7 @@ function startServer(port) {
       return;
     }
     if (url.pathname.startsWith("/media/")) {
+      if (!startupState.ready) return json(response, 503, { error: startupState.error ? "CAP startup failed; see server logs" : "CAP is still starting." });
       serveMedia(url, response);
       return;
     }
@@ -2118,8 +2154,9 @@ function startServer(port) {
   });
 
   server.listen(port, host, () => {
-    log(`CAP is running at http://${host}:${port}`);
+    log(`CAP HTTP server listening on ${host}:${port}. Starting database initialization.`);
     openBrowser(port);
+    setImmediate(initializeRuntime);
   });
 }
 
