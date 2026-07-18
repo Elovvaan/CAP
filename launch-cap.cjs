@@ -402,7 +402,7 @@ function createSession(response, request, userId) {
   run("DELETE FROM sessions WHERE expires_at <= ?", [new Date().toISOString()]);
   run(
     "INSERT INTO sessions (user_id, token_hash, expires_at, user_agent, ip_address) VALUES (?, ?, ?, ?, ?)",
-    [userId, tokenHash(token), expiresAt, sanitizeText(request.headers["user-agent"]), sanitizeText(request.socket.remoteAddress)]
+    [userId, tokenHash(token), expiresAt, sanitizeText(request.headers["user-agent"]), sanitizeText(getClientIp(request))]
   );
   response.setHeader("Set-Cookie", cookieHeader(sessionCookieName, token, { maxAge: Math.floor(sessionDurationMs / 1000) }));
 }
@@ -609,10 +609,13 @@ function sanitizeText(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function clientKey(request, scope) {
+function getClientIp(request) {
   const forwarded = String(request.headers["x-forwarded-for"] || "").split(",")[0].trim();
-  const ip = isHosted && forwarded ? forwarded : (request.socket.remoteAddress || "local");
-  return `${scope}:${ip}`;
+  return trustProxy && forwarded ? forwarded : (request.socket.remoteAddress || "local");
+}
+
+function clientKey(request, scope) {
+  return `${scope}:${getClientIp(request)}`;
 }
 
 function checkRateLimit(request, scope) {
