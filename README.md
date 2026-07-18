@@ -47,7 +47,7 @@ Recommended Railway volume paths:
 - `CAP_DATA_DIR=/data`
 - `CAP_DB_PATH=/data/cap.db`
 
-The first startup creates the founder/admin user only if no founder/admin user exists. `CAP_FOUNDER_PASSWORD` is used only for that first creation and is never applied again on later startups. After signing in, rotate the founder password from Account Settings and then remove or replace the one-time Railway password variable.
+On every startup, CAP ensures the user matching `CAP_FOUNDER_EMAIL` is the sole founder/admin. If that account does not yet exist, `CAP_FOUNDER_PASSWORD` (minimum 10 characters) is required to create it. If the account already exists, it is promoted to founder regardless of its current role, and any other accounts that previously held the founder type are demoted to creator. Changing `CAP_FOUNDER_EMAIL` to a different address on a later startup will promote the new address and demote the old one. `CAP_FOUNDER_PASSWORD` is ignored after the account is created; rotate the founder password from Account Settings and remove or replace the Railway variable once the account is set up.
 
 When an existing database is migrated for authentication, CAP writes a timestamped backup in the configured data directory:
 
