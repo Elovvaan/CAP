@@ -515,7 +515,7 @@ function initializeFounderUser() {
 }
 
 function assertNotFounderRegistrationEmail(email) {
-  const founderEmail = configuredFounderEmail();
+  const founderEmail = configuredFounderEmail({ logIfMissing: false });
   if (founderEmail && normalizeEmail(email) === founderEmail) {
     const error = new Error("The configured founder email cannot be registered publicly.");
     error.status = 409;
