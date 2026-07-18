@@ -63,9 +63,14 @@ async function start(extraEnv = {}) {
 
 async function stop() {
   if (!child) return;
-  const exiting = new Promise((resolve) => child.once("exit", resolve));
-  child.kill();
-  await Promise.race([exiting, wait(1500)]);
+  const proc = child;
+  const exiting = new Promise((resolve) => proc.once("exit", resolve));
+  proc.kill("SIGTERM");
+  const exited = await Promise.race([exiting.then(() => true), wait(1500).then(() => false)]);
+  if (!exited) {
+    proc.kill("SIGKILL");
+    await Promise.race([exiting, wait(1500)]);
+  }
   child = null;
 }
 
