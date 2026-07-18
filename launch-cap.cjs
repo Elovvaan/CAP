@@ -425,33 +425,103 @@ function requireAdmin(user) {
   }
 }
 
-function initializeFounderUser() {
-  const existingFounder = get("SELECT * FROM users WHERE account_type = 'founder' OR is_admin = 1 ORDER BY id LIMIT 1");
-  const founderCreator = get("SELECT * FROM creators WHERE lower(name) = lower(?) ORDER BY id LIMIT 1", ["Lorenzo Lewis"]);
-  if (existingFounder) {
-    if (founderCreator && !founderCreator.user_id) run("UPDATE creators SET user_id = ? WHERE id = ?", [existingFounder.id, founderCreator.id]);
-    return;
-  }
-
+function configuredFounderEmail(options = {}) {
+  const { logIfMissing = true } = options;
   const email = normalizeEmail(process.env.CAP_FOUNDER_EMAIL);
-  const password = String(process.env.CAP_FOUNDER_PASSWORD || "");
-  if (!email || !password) {
-    log("Founder account not created. Set CAP_FOUNDER_EMAIL and CAP_FOUNDER_PASSWORD for first-time founder initialization.");
-    return;
+  if (!email) {
+    if (logIfMissing) log("Founder account not configured. CAP_FOUNDER_EMAIL is missing.");
+    return "";
   }
-  if (!isValidEmail(email) || password.length < 10) {
-    log("Founder account not created. CAP_FOUNDER_EMAIL must be valid and CAP_FOUNDER_PASSWORD must be at least 10 characters.");
-    return;
+  if (!isValidEmail(email)) {
+    if (logIfMissing) log("Founder account not configured. CAP_FOUNDER_EMAIL is invalid.");
+    return "";
+  }
+  return email;
+}
+
+function bestFounderCreatorFor(user) {
+  const owned = user?.id ? get("SELECT * FROM creators WHERE user_id = ? ORDER BY id LIMIT 1", [user.id]) : null;
+  if (owned) return owned;
+
+  const profile = get("SELECT * FROM founder_profile WHERE id = 1");
+  const candidates = [];
+  if (profile?.name) candidates.push(["lower(name) = lower(?)", profile.name]);
+  if (profile?.handle) candidates.push(["lower(handle) = lower(?)", profile.handle]);
+  candidates.push(["lower(name) = lower(?)", "Lorenzo Lewis"]);
+
+  for (const [where, value] of candidates) {
+    const creator = get(`
+      SELECT c.*, u.account_type AS owner_account_type
+      FROM creators c
+      LEFT JOIN users u ON u.id = c.user_id
+      WHERE ${where}
+      ORDER BY c.id
+      LIMIT 1
+    `, [value]);
+    if (creator && (!creator.user_id || creator.owner_account_type === "founder")) return creator;
+  }
+  return null;
+}
+
+function linkFounderCreator(user) {
+  if (get("SELECT id FROM creators WHERE user_id = ? ORDER BY id LIMIT 1", [user.id])) return;
+  const creator = bestFounderCreatorFor(user);
+  if (creator && (!creator.user_id || Number(creator.user_id) !== Number(user.id))) {
+    run("UPDATE creators SET user_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [user.id, creator.id]);
+    log("Linked legacy founder creator profile to configured founder account.");
+  }
+}
+
+function initializeFounderUser() {
+  const email = configuredFounderEmail();
+  const password = String(process.env.CAP_FOUNDER_PASSWORD || "");
+  if (!email) return;
+
+  let founderUser = get("SELECT * FROM users WHERE email = ?", [email]);
+  if (founderUser) {
+    if (founderUser.account_type !== "founder" || !founderUser.is_admin || founderUser.status !== "active") {
+      run("UPDATE users SET account_type = 'founder', is_admin = 1, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [founderUser.id]);
+      log("Founder account promoted from existing configured user.");
+      founderUser = get("SELECT * FROM users WHERE id = ?", [founderUser.id]);
+    }
+  } else {
+    if (password.length < 10) {
+      log("Founder account not created. CAP_FOUNDER_PASSWORD is required and must be at least 10 characters when the configured founder user does not exist.");
+      return;
+    }
+    const founderCreator = bestFounderCreatorFor({ id: 0 });
+    const displayName = founderCreator?.name || "Lorenzo Lewis";
+    const result = run(
+      "INSERT INTO users (email, password_hash, display_name, account_type, is_admin, status) VALUES (?, ?, ?, 'founder', 1, 'active')",
+      [email, hashPassword(password), displayName]
+    );
+    founderUser = get("SELECT * FROM users WHERE id = ?", [Number(result.lastInsertRowid)]);
+    log("Founder account created from CAP_FOUNDER_EMAIL.");
   }
 
-  const displayName = founderCreator?.name || "Lorenzo Lewis";
-  const result = run(
-    "INSERT INTO users (email, password_hash, display_name, account_type, is_admin) VALUES (?, ?, ?, 'founder', 1)",
-    [email, hashPassword(password), displayName]
-  );
-  const userId = Number(result.lastInsertRowid);
-  if (founderCreator) run("UPDATE creators SET user_id = ? WHERE id = ?", [userId, founderCreator.id]);
-  log(`Founder account initialized for ${email}.`);
+  if (!founderUser) return;
+
+  const duplicateFounders = all("SELECT id FROM users WHERE account_type = 'founder' AND id != ? ORDER BY id", [founderUser.id]);
+  for (const duplicate of duplicateFounders) {
+    run("UPDATE users SET account_type = 'creator', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [duplicate.id]);
+    log("Duplicate founder account demoted to creator account type.");
+  }
+
+  if (!founderUser.is_admin || founderUser.status !== "active" || founderUser.account_type !== "founder") {
+    run("UPDATE users SET account_type = 'founder', is_admin = 1, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [founderUser.id]);
+    founderUser = get("SELECT * FROM users WHERE id = ?", [founderUser.id]);
+  }
+
+  linkFounderCreator(founderUser);
+}
+
+function assertNotFounderRegistrationEmail(email) {
+  const founderEmail = configuredFounderEmail({ logIfMissing: false });
+  if (founderEmail && normalizeEmail(email) === founderEmail) {
+    const error = new Error("The configured founder email cannot be registered publicly.");
+    error.status = 409;
+    throw error;
+  }
 }
 
 function setSetting(key, value) {
@@ -1169,6 +1239,7 @@ async function handleAuth(request, response, url) {
     const password = String(payload.password || "");
     const displayName = sanitizeText(payload.displayName);
     if (!isValidEmail(email)) throw new Error("Enter a valid email address.");
+    assertNotFounderRegistrationEmail(email);
     if (!displayName) throw new Error("Display name is required.");
     if (password.length < 10) throw new Error("Password must be at least 10 characters.");
     if (get("SELECT id FROM users WHERE email = ?", [email])) {
