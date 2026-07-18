@@ -8,7 +8,7 @@
     ["Messages", "Messages", "M"],
     ["Settings", "Settings", "S"]
   ];
-  const state = { active: "Home", query: "", data: null, viewingCreator: null, discoveryIndex: 0, status: "", authUser: null, authMode: "signin", authReady: false };
+  const state = { active: "Home", query: "", data: null, viewingCreator: null, discoveryIndex: 0, status: "", authUser: null, authMode: "signin", authReady: false, founderMode: null, founderSection: "Overview", founderControl: null };
   const maxImageBytes = 15 * 1024 * 1024;
   const socialPlatforms = ["YouTube", "Instagram", "TikTok", "Facebook", "X", "Vimeo", "Twitch", "Spotify", "SoundCloud", "LinkedIn", "Website", "Other"];
   const root = document.getElementById("root");
@@ -17,6 +17,8 @@
     Home: "H", Directory: "D", Circles: "C", Discovery: "Q", Collaborations: "W", Messages: "M", Settings: "S",
     Users: "U", Handshake: "W", Sparkles: "*", Star: "*", Play: ">", Plus: "+", Bell: "!"
   };
+
+  const founderSections = ["Overview", "Users", "Creators", "Moderation", "Reports", "Analytics", "Circles", "Collaborations", "Settings", "Health", "Maintenance", "Audit"];
 
   function escapeHtml(value) {
     return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
@@ -75,6 +77,12 @@
     }
     state.data = await api("/api/state", { method: "GET" });
     state.authUser = state.data.currentUser;
+    if (state.authUser?.accountType === "founder" && state.founderMode === null) state.founderMode = true;
+    if (state.authUser?.accountType !== "founder") state.founderMode = false;
+    if (state.authUser?.accountType === "founder" && state.founderMode) {
+      const founder = await api("/api/founder/control", { method: "GET" });
+      state.founderControl = founder.founderControl || null;
+    }
     render();
   }
 
@@ -87,6 +95,11 @@
       state.status = error.message;
       render(true);
     }
+  }
+
+  async function refreshFounderControl() {
+    const payload = await api("/api/founder/control", { method: "GET" });
+    state.founderControl = payload.founderControl || null;
   }
 
   function filteredCreators() {
@@ -404,6 +417,11 @@
       bindAuthForms();
       return;
     }
+    if (state.authUser?.accountType === "founder" && state.founderMode) {
+      root.innerHTML = founderControlShell(error);
+      bindFounderControl();
+      return;
+    }
     const data = state.data || { creators: [], circles: [], activity: [], collaborations: [], messages: [], stats: {}, profile: null, circleMembership: [] };
     const profile = data.profile;
     root.innerHTML = `
@@ -432,6 +450,7 @@
             <div class="top-actions">
               <label class="search-box"><span>?</span><input id="global-search" value="${escapeHtml(state.query)}" placeholder="Search creators, skills, circles..."></label>
               <button class="icon-button" aria-label="Notifications">${iconMap.Bell}</button>
+              ${state.authUser?.accountType === "founder" ? `<button class="secondary-button" data-founder-control>Founder Control</button>` : ""}
               <button class="secondary-button" data-account>Account Settings</button>
               <button class="secondary-button" data-sign-out>Sign Out</button>
               <button class="primary-button" data-quick><span>${iconMap.Plus}</span> Quick Action</button>
@@ -465,6 +484,135 @@
 
   function panelHeader(title, action, nav) {
     return `<div class="panel-header"><h2>${title}</h2>${action ? `<button data-nav="${nav || ""}">${action}</button>` : ""}</div>`;
+  }
+
+  function founderControlShell(error = false) {
+    const profile = state.data?.profile || {};
+    return `<div class="app-shell founder-shell">
+      <aside class="sidebar founder-sidebar">
+        <div class="brand-block">
+          <div class="brand-mark logo-mark"><img src="./assets/cap-logo.jpg" alt="CAP logo"></div>
+          <div><strong>CAP</strong><span>Founder Control Center</span></div>
+        </div>
+        <nav class="nav-list">
+          ${founderSections.map((section) => `<button class="${state.founderSection === section ? "nav-item active" : "nav-item"}" data-founder-section="${section}"><span>${section[0]}</span><span>${section}</span></button>`).join("")}
+        </nav>
+        <button class="profile-card profile-card-button" data-creator-mode>
+          ${imageWithFallback(profile?.image, "profile-image", profile?.name || "CAP", "avatar founder", initials(profile?.name || "CAP"))}
+          <div class="profile-copy"><strong>${escapeHtml(profile?.name || "Founder")}</strong><span>Switch to Creator Mode</span></div>
+          <span class="profile-more">...</span>
+        </button>
+      </aside>
+      <main class="main-content">
+        <header class="topbar">
+          <div><h1>Founder Control Center</h1><p>Platform operations, governance, and health for CAP.</p></div>
+          <div class="top-actions">
+            <button class="secondary-button" data-creator-mode>Creator Mode</button>
+            <button class="secondary-button" data-sign-out>Sign Out</button>
+          </div>
+        </header>
+        <div class="status-line ${error ? "error" : ""}">${escapeHtml(state.status)}</div>
+        ${founderControlView()}
+      </main>
+    </div>`;
+  }
+
+  function founderMetric(title, value, detail) {
+    return `<article class="stat-card founder-stat"><div class="stat-icon">*</div><div><strong>${escapeHtml(value)}</strong><span>${escapeHtml(title)}</span><small>${escapeHtml(detail || "")}</small></div></article>`;
+  }
+
+  function founderRecord(title, detail, meta = "") {
+    return `<article class="record-card"><header><h3>${escapeHtml(title)}</h3>${meta ? `<span class="mini-pill">${escapeHtml(meta)}</span>` : ""}</header><p>${escapeHtml(detail || "No detail recorded.")}</p></article>`;
+  }
+
+  function founderRanking(title, rows) {
+    return `<div class="panel">${panelHeader(title, "")}<div class="records-list">${rows?.length ? rows.map((row) => founderRecord(row.name, `${Number(row.count || 0)} signals`, `#${row.id}`)).join("") : `<p class="empty-copy">No analytics yet.</p>`}</div></div>`;
+  }
+
+  function founderControlView() {
+    const control = state.founderControl || {};
+    switch (state.founderSection) {
+      case "Users": return founderUsersView(control.users || []);
+      case "Creators": return founderCreatorsView(control.creators || []);
+      case "Moderation": return founderMetricGrid(control.moderation || {}, "Moderation");
+      case "Reports": return founderMetricGrid(control.reports || {}, "Reports");
+      case "Analytics": return founderAnalyticsView(control.analytics || {});
+      case "Circles": return founderListView("Circles", control.circles || [], (item) => founderRecord(item.name, item.detail || `${Number(item.members || 0)} members`, `${Number(item.members || 0)} members`));
+      case "Collaborations": return founderListView("Collaborations", control.collaborations || [], (item) => founderRecord(item.title, `${item.creatorName || "No creator"} · ${item.requesterEmail || "No requester"}`, item.status || "Requested"));
+      case "Settings": return founderSettingsView(control.platformSettings || {});
+      case "Health": return founderMetricGrid(control.systemHealth || {}, "System Health");
+      case "Maintenance": return founderMaintenanceView(control.maintenanceTools || {});
+      case "Audit": return founderListView("Founder Audit Log", control.auditLog || [], (item) => founderRecord(item.action, `${item.targetType || "system"} ${item.targetId || ""} · ${item.detail || ""}`, relativeTime(item.createdAt)));
+      default: return founderOverviewView(control);
+    }
+  }
+
+  function founderMetricGrid(items, title) {
+    return `<section class="content-grid directory-only"><div class="panel">${panelHeader(title, "")}<div class="stats-grid founder-grid">${Object.entries(items).map(([key, value]) => founderMetric(key.replace(/([A-Z])/g, " $1"), value, "")).join("")}</div></div></section>`;
+  }
+
+  function founderOverviewView(control) {
+    const overview = control.overview || {};
+    return `<section class="founder-dashboard">
+      <div class="stats-grid founder-grid">
+        ${founderMetric("Users", overview.totalUsers || 0, `${overview.activeUsers || 0} active`)}
+        ${founderMetric("Creators", overview.totalCreators || 0, `${overview.completeCreators || 0} complete`)}
+        ${founderMetric("Circles", overview.totalCircles || 0, "growth communities")}
+        ${founderMetric("Collaborations", overview.activeCollaborations || 0, "active requests")}
+      </div>
+      <section class="dashboard-grid">
+        ${founderRanking("Most Viewed Creators", control.analytics?.mostViewedCreators || [])}
+        ${founderListView("Recent Users", (control.users || []).slice(0, 5), (item) => founderRecord(item.displayName || item.email, item.email, item.accountType))}
+        ${founderListView("System Health", [control.systemHealth || {}], (item) => founderRecord(item.status || "Unknown", `${item.database || "SQLite"} · ${item.storage || ""}`, item.hostMode || ""))}
+      </section>
+    </section>`;
+  }
+
+  function founderUsersView(users) {
+    return `<section class="content-grid directory-only"><div class="panel">${panelHeader("User Management", "")}<div class="records-list">${users.length ? users.map((user) => `<article class="record-card founder-user-card">
+      <header><h3>${escapeHtml(user.displayName || user.email)}</h3><span class="mini-pill">${escapeHtml(user.accountType || "creator")}${user.isAdmin && user.accountType !== "founder" ? " · admin" : ""}</span></header>
+      <p>${escapeHtml(user.email)} · ${escapeHtml(user.status || "active")}</p>
+      <form class="inline-buttons founder-user-form" data-founder-user="${user.id}">
+        <input name="displayName" value="${escapeHtml(user.displayName || "")}" aria-label="Display name">
+        <select name="status" aria-label="Status"><option value="active" ${user.status === "active" ? "selected" : ""}>active</option><option value="deactivated" ${user.status === "deactivated" ? "selected" : ""}>deactivated</option></select>
+        <label class="mini-toggle"><input type="checkbox" name="isAdmin" ${user.isAdmin ? "checked" : ""} ${user.accountType === "founder" ? "disabled" : ""}> Admin</label>
+        <button class="secondary-button" type="submit">Save</button>
+      </form>
+    </article>`).join("") : `<p class="empty-copy">No users yet.</p>`}</div></div></section>`;
+  }
+
+  function founderCreatorsView(creators) {
+    return founderListView("Creator Profile Management", creators, (creator) => founderRecord(creator.name || "Unnamed creator", `${creator.handle || ""} · ${creator.ownerEmail || "No owner"} · ${creator.location || "No location"}`, creator.ownerStatus || "active"));
+  }
+
+  function founderAnalyticsView(analytics) {
+    return `<section class="content-grid">
+      ${founderRanking("Most Viewed Creators", analytics.mostViewedCreators || [])}
+      ${founderRanking("Most Followed Creators", analytics.mostFollowedCreators || [])}
+      ${founderRanking("Most Saved Creators", analytics.mostSavedCreators || [])}
+      ${founderRanking("Fastest Growing Creators", analytics.fastestGrowingCreators || [])}
+    </section>`;
+  }
+
+  function founderListView(title, rows, renderer) {
+    return `<section class="content-grid directory-only"><div class="panel">${panelHeader(title, "")}<div class="records-list">${rows.length ? rows.map(renderer).join("") : `<p class="empty-copy">No records yet.</p>`}</div></div></section>`;
+  }
+
+  function founderSettingsView(settings) {
+    return `<section class="content-grid directory-only"><div class="panel">${panelHeader("Platform Settings", "")}<form id="founder-settings-form" class="form-grid">
+      ${field("workspaceName", "Workspace name", settings.workspaceName || "CAP")}
+      ${area("mission", "Platform mission", settings.mission || "", "full")}
+      ${area("notes", "Founder notes", settings.notes || "", "full")}
+      <div class="form-actions full"><button class="primary-button" type="submit">Save Platform Settings</button></div>
+    </form></div></section>`;
+  }
+
+  function founderMaintenanceView(tools) {
+    return `<section class="content-grid directory-only"><div class="panel">${panelHeader("Maintenance Tools", "")}<div class="records-list">
+      ${founderRecord("Discovery cache", `${Number(tools.discoveryCacheUsers || 0)} user queues currently cached`, "cache")}
+      ${founderRecord("Expired sessions", `${Number(tools.staleSessions || 0)} expired sessions can be pruned naturally`, "sessions")}
+      <button class="secondary-button" data-maintenance-action="clear-discovery-cache">Clear Discovery Cache</button>
+    </div></div></section>`;
   }
 
   function homeView() {
@@ -1150,12 +1298,21 @@
 
   function bindGlobal() {
     root.querySelectorAll("[data-nav]").forEach((button) => button.addEventListener("click", () => { state.active = button.dataset.nav; state.status = ""; render(); }));
+    root.querySelectorAll("[data-founder-control]").forEach((button) => button.addEventListener("click", async () => {
+      state.founderMode = true;
+      state.founderSection = "Overview";
+      state.status = "";
+      await refreshFounderControl();
+      render();
+    }));
     root.querySelector("[data-my-profile]")?.addEventListener("click", () => { state.active = "MyProfile"; state.status = ""; render(); });
     root.querySelector("[data-account]")?.addEventListener("click", () => { state.active = "Account"; state.status = ""; render(); });
     root.querySelectorAll("[data-sign-out]").forEach((button) => button.addEventListener("click", async () => {
       await api("/api/auth/logout", { method: "POST", body: JSON.stringify({}) });
       state.authUser = null;
       state.data = null;
+      state.founderMode = null;
+      state.founderControl = null;
       state.active = "Home";
       state.status = "Signed out.";
       render();
@@ -1254,6 +1411,74 @@
     });
     bindUploadPreviews();
     bindForms();
+  }
+
+  function bindFounderControl() {
+    root.querySelectorAll("[data-founder-section]").forEach((button) => button.addEventListener("click", () => {
+      state.founderSection = button.dataset.founderSection;
+      state.status = "";
+      render();
+    }));
+    root.querySelectorAll("[data-creator-mode]").forEach((button) => button.addEventListener("click", () => {
+      state.founderMode = false;
+      state.active = "Home";
+      state.status = "Creator Mode active.";
+      render();
+    }));
+    root.querySelectorAll("[data-sign-out]").forEach((button) => button.addEventListener("click", async () => {
+      await api("/api/auth/logout", { method: "POST", body: JSON.stringify({}) });
+      state.authUser = null;
+      state.data = null;
+      state.founderMode = null;
+      state.founderControl = null;
+      state.active = "Home";
+      state.status = "Signed out.";
+      render();
+    }));
+    root.querySelectorAll(".founder-user-form").forEach((form) => form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        const payload = formData(form);
+        const result = await api("/api/founder/users", {
+          method: "POST",
+          body: JSON.stringify({
+            userId: Number(form.dataset.founderUser),
+            displayName: payload.displayName,
+            status: payload.status,
+            isAdmin: Boolean(form.querySelector('input[name="isAdmin"]')?.checked)
+          })
+        });
+        state.founderControl = result.founderControl || null;
+        state.status = "User updated.";
+        render();
+      } catch (error) {
+        state.status = error.message;
+        render(true);
+      }
+    }));
+    root.querySelector("#founder-settings-form")?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        const result = await api("/api/founder/settings", { method: "POST", body: JSON.stringify(formData(event.currentTarget)) });
+        state.founderControl = result.founderControl || null;
+        state.status = "Platform settings saved.";
+        render();
+      } catch (error) {
+        state.status = error.message;
+        render(true);
+      }
+    });
+    root.querySelectorAll("[data-maintenance-action]").forEach((button) => button.addEventListener("click", async () => {
+      try {
+        const result = await api("/api/founder/maintenance", { method: "POST", body: JSON.stringify({ action: button.dataset.maintenanceAction }) });
+        state.founderControl = result.founderControl || null;
+        state.status = "Maintenance action completed.";
+        render();
+      } catch (error) {
+        state.status = error.message;
+        render(true);
+      }
+    }));
   }
 
   function bindForms() {
