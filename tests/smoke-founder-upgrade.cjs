@@ -54,17 +54,23 @@ async function start(extraEnv = {}) {
       const health = await request("/health");
       if (health.response.ok) return;
     } catch {
-      await wait(200);
+      // ignore and retry
     }
+    await wait(200);
   }
   throw new Error(`CAP server did not start. ${output}`);
 }
 
 async function stop() {
   if (!child) return;
-  const exiting = new Promise((resolve) => child.once("exit", resolve));
-  child.kill();
-  await Promise.race([exiting, wait(1500)]);
+  const proc = child;
+  const exiting = new Promise((resolve) => proc.once("exit", resolve));
+  proc.kill("SIGTERM");
+  const exited = await Promise.race([exiting.then(() => true), wait(1500).then(() => false)]);
+  if (!exited) {
+    proc.kill("SIGKILL");
+    await Promise.race([exiting, wait(1500)]);
+  }
   child = null;
 }
 
