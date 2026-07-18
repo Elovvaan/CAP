@@ -21,12 +21,6 @@
     return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
   }
 
-  function accountLabel(user) {
-    if (user?.accountType === "founder") return "Founder";
-    if (user?.isAdmin) return "Admin";
-    return "Creator";
-  }
-
   function initials(name) {
     const parts = String(name || "CAP").trim().split(/\s+/).filter(Boolean);
     return (parts[0]?.[0] || "C") + (parts[1]?.[0] || "");
@@ -386,7 +380,6 @@
     }
     const data = state.data || { creators: [], circles: [], activity: [], collaborations: [], messages: [], stats: {}, profile: null, circleMembership: [] };
     const profile = data.profile;
-    const user = data.currentUser || state.authUser || {};
     root.innerHTML = `
       <div class="app-shell">
         <aside class="sidebar">
@@ -399,7 +392,7 @@
           </nav>
           <button class="profile-card profile-card-button" data-my-profile>
             ${imageWithFallback(profile?.image, "profile-image", profile?.name || "CAP", "avatar founder", initials(profile?.name || "CAP"))}
-            <div class="profile-copy"><strong>${escapeHtml(profile?.name || "Create profile")}</strong><span>${escapeHtml(accountLabel(user))}</span></div>
+            <div class="profile-copy"><strong>${escapeHtml(profile?.name || "Create profile")}</strong><span>${escapeHtml(profile?.role || "Founder")}</span></div>
             <span class="profile-more">...</span>
           </button>
           <div class="mission-card">
@@ -777,13 +770,11 @@
   function myProfileView() {
     const p = state.data.profile || {};
     const mine = myCreator();
-    const accountType = accountLabel(state.data.currentUser || state.authUser || {});
     const platformLines = (mine?.platforms || safeJson(state.data.settings.profilePlatforms, []) || []).map((item) => `${item.platform || ""}|${item.url || ""}`).join("\n");
     const videoLines = (mine?.videos || safeJson(state.data.settings.profileVideos, []) || []).map((item) => `${item.title || ""}|${item.url || ""}`).join("\n");
     return `<section class="profile-page">
       <div class="panel profile-editor-panel">
         ${panelHeader("My Profile", "")}
-        <p class="empty-copy slim">Account type: ${escapeHtml(accountType)}</p>
         <form id="my-profile-form" class="form-grid">
           ${field("name", "Creator name", p.name || mine?.name || "", true)}
           ${field("handle", "Handle", p.handle || mine?.handle || "")}
@@ -985,7 +976,6 @@
     return `<section class="content-grid directory-only">
       <div class="panel">${panelHeader("Account Settings", "")}
         <form id="account-form" class="form-grid">
-          <p class="empty-copy slim full">Account type: ${escapeHtml(accountLabel(user))}</p>
           ${field("displayName", "Display name", user.displayName || "")}
           ${field("email", "Email", user.email || "")}
           ${field("currentPassword", "Current password", "", false, "password")}
