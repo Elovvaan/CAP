@@ -486,7 +486,14 @@ function founderStatus(value, allowed, fallback) {
 function createFounderBackup(user) {
   const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
   const backupPath = path.join(dataDir, `cap-founder-backup-${stamp}.db`);
+  try {
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+  } catch {
+    // Best-effort checkpoint; continue with file copy.
+  }
   fs.copyFileSync(dbPath, backupPath);
+  if (fs.existsSync(`${dbPath}-wal`)) fs.copyFileSync(`${dbPath}-wal`, `${backupPath}-wal`);
+  if (fs.existsSync(`${dbPath}-shm`)) fs.copyFileSync(`${dbPath}-shm`, `${backupPath}-shm`);
   setSetting(`maintenance:backup:${stamp}`, "created");
   founderAudit(user, "created safe backup", "maintenance", stamp, "SQLite database copied to persistent data storage");
   return stamp;
