@@ -55,6 +55,8 @@ async function waitForServer() {
       // Keep retrying until the server is ready.
     }
     await wait(250);
+      await wait(250);
+    }
   }
   throw new Error(`CAP server did not start. ${output}`);
 }
