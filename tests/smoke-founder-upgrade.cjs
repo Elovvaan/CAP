@@ -54,8 +54,9 @@ async function start(extraEnv = {}) {
       const health = await request("/health");
       if (health.response.ok) return;
     } catch {
-      await wait(200);
+      // ignore and retry
     }
+    await wait(200);
   }
   throw new Error(`CAP server did not start. ${output}`);
 }
