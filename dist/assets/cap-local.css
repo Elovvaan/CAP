@@ -111,8 +111,16 @@
 .profile-video-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .profile-video-card { padding: 10px; }
 .profile-video-card .video-frame { border-radius: 8px; }
+.social-platform-editor { display: grid; gap: 10px; }
+.form-section-heading h3 { margin: 0; color: #e8eefb; font-size: 14px; }
+.social-platform-row { display: grid; grid-template-columns: 170px 1fr 1.3fr auto; gap: 10px; align-items: end; border: 1px solid #203149; border-radius: 12px; background: rgba(5, 12, 24, .74); padding: 12px; }
+.social-remove-button { align-self: end; min-height: 38px; }
+.inline-form-actions { padding: 0; }
+.video-link-card { min-height: 120px; border: 1px solid #203149; border-radius: 10px; background: #07101c; display: grid; place-items: center; gap: 10px; padding: 16px; text-align: center; }
+.video-link-card span { color: #c6b5ff; font-size: 12px; }
 @media (max-width: 900px) {
   .public-profile-grid, .profile-video-grid { grid-template-columns: 1fr; }
+  .social-platform-row { grid-template-columns: 1fr; }
   .public-profile-identity { align-items: start; }
   .public-profile-title h2 { font-size: 22px; }
 }
