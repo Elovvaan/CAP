@@ -52,6 +52,9 @@ async function waitForServer() {
       const health = await request("/health");
       if (health.response.ok) return;
     } catch {
+      // Keep retrying until the server is ready.
+    }
+    await wait(250);
       await wait(250);
     }
   }

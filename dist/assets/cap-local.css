@@ -118,6 +118,13 @@
 .inline-form-actions { padding: 0; }
 .video-link-card { min-height: 120px; border: 1px solid #203149; border-radius: 10px; background: #07101c; display: grid; place-items: center; gap: 10px; padding: 16px; text-align: center; }
 .video-link-card span { color: #c6b5ff; font-size: 12px; }
+.founder-shell .topbar { border-bottom: 1px solid rgba(160, 180, 220, .12); margin-bottom: 14px; }
+.founder-sidebar .nav-list { gap: 4px; }
+.founder-dashboard { display: grid; gap: 14px; }
+.founder-grid { padding: 14px; margin-bottom: 0; }
+.founder-stat small { display: block; color: #7f91aa; font-size: 11px; margin-top: 3px; }
+.founder-user-card input, .founder-user-card select { min-height: 38px; border: 1px solid #26384f; border-radius: 9px; background: rgba(5, 12, 24, .74); color: #f4f7ff; padding: 8px 10px; }
+.mini-toggle { display: inline-flex; align-items: center; gap: 6px; color: #c6b5ff; font-size: 12px; }
 @media (max-width: 900px) {
   .public-profile-grid, .profile-video-grid { grid-template-columns: 1fr; }
   .social-platform-row { grid-template-columns: 1fr; }

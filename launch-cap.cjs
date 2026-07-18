@@ -246,6 +246,16 @@ function initializeDatabase() {
       followed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(follower_user_id, creator_id)
     );
+
+    CREATE TABLE IF NOT EXISTS founder_audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      founder_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      action TEXT NOT NULL,
+      target_type TEXT NOT NULL DEFAULT '',
+      target_id TEXT NOT NULL DEFAULT '',
+      detail TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
   `);
 
   const requiredCreatorColumns = [
@@ -279,6 +289,7 @@ function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_creator_hides_user ON creator_hides(user_id, creator_id);
     CREATE INDEX IF NOT EXISTS idx_creator_follows_user ON creator_follows(follower_user_id, creator_id);
     CREATE INDEX IF NOT EXISTS idx_creator_follows_creator ON creator_follows(creator_id);
+    CREATE INDEX IF NOT EXISTS idx_founder_audit_log_created ON founder_audit_log(created_at);
   `);
   initializeFounderUser();
 }
@@ -425,6 +436,21 @@ function requireAdmin(user) {
     error.status = 403;
     throw error;
   }
+}
+
+function requireFounder(user) {
+  if (!user || user.account_type !== "founder") {
+    const error = new Error("Founder access required.");
+    error.status = 403;
+    throw error;
+  }
+}
+
+function founderAudit(user, action, targetType = "", targetId = "", detail = "") {
+  run(
+    "INSERT INTO founder_audit_log (founder_user_id, action, target_type, target_id, detail) VALUES (?, ?, ?, ?, ?)",
+    [user?.id || null, sanitizeText(action), sanitizeText(targetType), sanitizeText(targetId), sanitizeText(detail)]
+  );
 }
 
 function configuredFounderEmail(options = {}) {
@@ -1136,6 +1162,136 @@ function getState(user) {
   };
 }
 
+function getFounderControlCenter(user) {
+  requireFounder(user);
+  const totalUsers = get("SELECT COUNT(*) AS count FROM users").count;
+  const activeUsers = get("SELECT COUNT(*) AS count FROM users WHERE status = 'active'").count;
+  const adminUsers = get("SELECT COUNT(*) AS count FROM users WHERE is_admin = 1 AND account_type != 'founder'").count;
+  const totalCreators = get("SELECT COUNT(*) AS count FROM creators").count;
+  const completeCreators = get("SELECT COUNT(*) AS count FROM creators WHERE name != '' AND handle != '' AND role != '' AND category != '' AND description != ''").count;
+  const totalCircles = get("SELECT COUNT(*) AS count FROM creator_circles").count;
+  const activeCollaborations = get("SELECT COUNT(*) AS count FROM collaboration_requests WHERE status != 'Completed'").count;
+  const settings = getSettings();
+  return {
+    overview: {
+      totalUsers,
+      activeUsers,
+      adminUsers,
+      totalCreators,
+      completeCreators,
+      totalCircles,
+      activeCollaborations,
+      messages: get("SELECT COUNT(*) AS count FROM messages").count,
+      contributionPoints: get("SELECT COALESCE(SUM(points), 0) AS count FROM contribution_activity").count
+    },
+    users: all(`
+      SELECT id, email, display_name AS displayName, account_type AS accountType, is_admin AS isAdmin, status,
+             created_at AS createdAt, updated_at AS updatedAt, last_login_at AS lastLoginAt
+      FROM users
+      ORDER BY created_at DESC, id DESC
+      LIMIT 100
+    `),
+    creators: all(`
+      SELECT c.id, c.name, c.handle, c.role, c.category, c.location, c.updated_at AS updatedAt,
+             u.email AS ownerEmail, u.account_type AS ownerAccountType, u.status AS ownerStatus
+      FROM creators c
+      LEFT JOIN users u ON u.id = c.user_id
+      ORDER BY c.updated_at DESC, c.id DESC
+      LIMIT 100
+    `),
+    moderation: {
+      deactivatedUsers: get("SELECT COUNT(*) AS count FROM users WHERE status != 'active'").count,
+      creatorsMissingImages: get("SELECT COUNT(*) AS count FROM creators WHERE image = '' OR banner = ''").count,
+      creatorsMissingDescriptions: get("SELECT COUNT(*) AS count FROM creators WHERE description = ''").count,
+      openCollaborations: activeCollaborations,
+      orphanCreators: get("SELECT COUNT(*) AS count FROM creators WHERE user_id IS NULL").count
+    },
+    reports: {
+      activityEvents: get("SELECT COUNT(*) AS count FROM contribution_activity").count,
+      saves: get("SELECT COUNT(*) AS count FROM saved_creators").count,
+      follows: get("SELECT COUNT(*) AS count FROM creator_follows").count,
+      views: get("SELECT COUNT(*) AS count FROM creator_views").count,
+      hides: get("SELECT COUNT(*) AS count FROM creator_hides").count
+    },
+    analytics: {
+      mostViewedCreators: all(`
+        SELECT c.id, c.name, COUNT(v.id) AS count
+        FROM creator_views v
+        JOIN creators c ON c.id = v.creator_id
+        GROUP BY c.id
+        ORDER BY count DESC, c.updated_at DESC
+        LIMIT 8
+      `),
+      mostFollowedCreators: all(`
+        SELECT c.id, c.name, COUNT(f.id) AS count
+        FROM creator_follows f
+        JOIN creators c ON c.id = f.creator_id
+        GROUP BY c.id
+        ORDER BY count DESC, c.updated_at DESC
+        LIMIT 8
+      `),
+      mostSavedCreators: all(`
+        SELECT c.id, c.name, COUNT(s.creator_id) AS count
+        FROM saved_creators s
+        JOIN creators c ON c.id = s.creator_id
+        GROUP BY c.id
+        ORDER BY count DESC, c.updated_at DESC
+        LIMIT 8
+      `),
+      fastestGrowingCreators: all(`
+        SELECT c.id, c.name, COUNT(f.id) + COUNT(v.id) AS count
+        FROM creators c
+        LEFT JOIN creator_follows f ON f.creator_id = c.id AND f.followed_at >= datetime('now', '-7 days')
+        LEFT JOIN creator_views v ON v.creator_id = c.id AND v.viewed_at >= datetime('now', '-7 days')
+        GROUP BY c.id
+        ORDER BY count DESC, c.created_at DESC
+        LIMIT 8
+      `)
+    },
+    circles: all(`
+      SELECT c.id, c.name, c.detail, c.accent, COUNT(m.creator_id) AS members, c.created_at AS createdAt
+      FROM creator_circles c
+      LEFT JOIN circle_membership m ON m.circle_id = c.id
+      GROUP BY c.id
+      ORDER BY c.created_at DESC, c.id DESC
+      LIMIT 100
+    `),
+    collaborations: all(`
+      SELECT cr.id, cr.title, cr.status, cr.progress, cr.created_at AS createdAt, c.name AS creatorName, u.email AS requesterEmail
+      FROM collaboration_requests cr
+      LEFT JOIN creators c ON c.id = cr.creator_id
+      LEFT JOIN users u ON u.id = cr.requester_user_id
+      ORDER BY cr.created_at DESC, cr.id DESC
+      LIMIT 100
+    `),
+    platformSettings: {
+      workspaceName: settings.workspaceName || "CAP",
+      notes: settings.notes || "",
+      mission: settings.mission || ""
+    },
+    systemHealth: {
+      status: "OK",
+      storage: isHosted ? "persistent hosted storage" : "local app data",
+      database: "SQLite",
+      hostMode: isHosted ? "hosted" : "local desktop",
+      auditEvents: get("SELECT COUNT(*) AS count FROM founder_audit_log").count
+    },
+    maintenanceTools: {
+      discoveryCacheUsers: discoveryCache.size,
+      databaseBackups: all("SELECT key, value FROM application_settings WHERE key LIKE 'maintenance:%' ORDER BY key").length,
+      staleSessions: get("SELECT COUNT(*) AS count FROM sessions WHERE expires_at <= ?", [new Date().toISOString()]).count
+    },
+    auditLog: all(`
+      SELECT a.id, a.action, a.target_type AS targetType, a.target_id AS targetId, a.detail, a.created_at AS createdAt,
+             u.email AS founderEmail
+      FROM founder_audit_log a
+      LEFT JOIN users u ON u.id = a.founder_user_id
+      ORDER BY a.created_at DESC, a.id DESC
+      LIMIT 50
+    `)
+  };
+}
+
 function saveProfile(payload, user = null) {
   if (user) requireAdmin(user);
   run(
@@ -1395,6 +1551,56 @@ async function handleApi(request, response, url) {
     const user = requireUser(request);
 
     if (request.method === "GET" && url.pathname === "/api/state") return json(response, 200, getState(user));
+
+    if (request.method === "GET" && url.pathname === "/api/founder/control") {
+      const data = getFounderControlCenter(user);
+      return json(response, 200, { founderControl: data });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/founder/users") {
+      requireFounder(user);
+      const payload = await readJson(request);
+      const targetId = Number(payload.userId);
+      if (!targetId) throw new Error("User is required.");
+      const target = get("SELECT * FROM users WHERE id = ?", [targetId]);
+      if (!target) throw new Error("User was not found.");
+      const status = sanitizeText(payload.status) || target.status;
+      const isAdmin = payload.isAdmin === undefined ? Boolean(target.is_admin) : ["1", "true", "on"].includes(String(payload.isAdmin).toLowerCase());
+      const accountType = target.account_type === "founder" ? "founder" : "creator";
+      if (!["active", "deactivated"].includes(status)) throw new Error("User status must be active or deactivated.");
+      if (target.account_type === "founder" && target.id !== user.id) throw new Error("Only the configured founder can hold founder status.");
+      if (target.id === user.id && status !== "active") throw new Error("The founder account cannot deactivate itself.");
+      run("UPDATE users SET display_name = ?, account_type = ?, is_admin = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [
+        sanitizeText(payload.displayName) || target.display_name,
+        accountType,
+        target.account_type === "founder" ? 1 : (isAdmin ? 1 : 0),
+        status,
+        targetId
+      ]);
+      founderAudit(user, "updated user account", "user", String(targetId), `status=${status}; admin=${target.account_type === "founder" ? 1 : (isAdmin ? 1 : 0)}`);
+      return json(response, 200, { founderControl: getFounderControlCenter(user) });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/founder/settings") {
+      requireFounder(user);
+      const payload = await readJson(request);
+      const allowed = ["workspaceName", "notes", "mission"];
+      for (const key of allowed) {
+        if (Object.prototype.hasOwnProperty.call(payload, key)) setSetting(key, sanitizeText(payload[key]));
+      }
+      founderAudit(user, "updated platform settings", "settings", "platform", allowed.filter((key) => Object.prototype.hasOwnProperty.call(payload, key)).join(", "));
+      return json(response, 200, { founderControl: getFounderControlCenter(user) });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/founder/maintenance") {
+      requireFounder(user);
+      const payload = await readJson(request);
+      const action = sanitizeText(payload.action);
+      if (action !== "clear-discovery-cache") throw new Error("Unsupported maintenance action.");
+      discoveryCache.clear();
+      founderAudit(user, "cleared discovery cache", "maintenance", "discovery-cache", "Founder maintenance tool");
+      return json(response, 200, { founderControl: getFounderControlCenter(user) });
+    }
 
     if (request.method === "GET" && url.pathname === "/api/discovery") {
       return json(response, 200, { recommendations: getDiscoveryQueue(user, url.searchParams.get("refresh") === "1") });
