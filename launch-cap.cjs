@@ -1717,13 +1717,18 @@ async function handleApi(request, response, url) {
       const payload = await readJson(request);
       const action = sanitizeText(payload.action);
       if (action === "create") {
+        const targetType = sanitizeText(payload.targetType);
+        const targetId = sanitizeText(payload.targetId);
+        const reason = sanitizeText(payload.reason);
+        if (!targetType || !targetId || !reason) throw new Error("Report target type, target id, and reason are required.");
         run("INSERT INTO founder_reports (reporter_user_id, target_type, target_id, reason, status) VALUES (?, ?, ?, ?, 'open')", [
           user.id,
-          sanitizeText(payload.targetType),
-          sanitizeText(payload.targetId),
-          sanitizeText(payload.reason)
+          targetType,
+          targetId,
+          reason
         ]);
-        founderAudit(user, "created founder report", sanitizeText(payload.targetType), sanitizeText(payload.targetId), sanitizeText(payload.reason));
+        founderAudit(user, "created founder report", targetType, targetId, reason);
+      }
       } else {
         const reportId = Number(payload.reportId);
         if (!reportId) throw new Error("Report is required.");
