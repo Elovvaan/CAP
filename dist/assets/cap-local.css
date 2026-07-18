@@ -119,17 +119,26 @@
 .video-link-card { min-height: 120px; border: 1px solid #203149; border-radius: 10px; background: #07101c; display: grid; place-items: center; gap: 10px; padding: 16px; text-align: center; }
 .video-link-card span { color: #c6b5ff; font-size: 12px; }
 .founder-shell .topbar { border-bottom: 1px solid rgba(160, 180, 220, .12); margin-bottom: 14px; }
-.founder-sidebar .nav-list { gap: 4px; }
+.founder-sidebar .nav-list { gap: 8px; }
+.founder-nav-group { display: grid; gap: 4px; }
+.founder-nav-heading { padding: 8px 12px 2px; color: #7f91aa; font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.founder-search { min-height: 46px; min-width: 260px; border: 1px solid #26384f; border-radius: 10px; background: rgba(5, 12, 24, .74); color: #f4f7ff; padding: 0 14px; }
 .founder-dashboard { display: grid; gap: 14px; }
 .founder-grid { padding: 14px; margin-bottom: 0; }
+.founder-clickable-card { cursor: pointer; transition: border-color .16s ease, transform .16s ease; }
+.founder-clickable-card:hover { border-color: rgba(139, 92, 246, .72); transform: translateY(-1px); }
 .founder-stat small { display: block; color: #7f91aa; font-size: 11px; margin-top: 3px; }
-.founder-user-card input, .founder-user-card select { min-height: 38px; border: 1px solid #26384f; border-radius: 9px; background: rgba(5, 12, 24, .74); color: #f4f7ff; padding: 8px 10px; }
+.founder-user-card input, .founder-user-card select, .founder-inline-form input, .founder-inline-form select { min-height: 38px; border: 1px solid #26384f; border-radius: 9px; background: rgba(5, 12, 24, .74); color: #f4f7ff; padding: 8px 10px; }
+.founder-inline-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+.founder-inline-form input { min-width: 150px; flex: 1 1 150px; }
 .mini-toggle { display: inline-flex; align-items: center; gap: 6px; color: #c6b5ff; font-size: 12px; }
 @media (max-width: 900px) {
   .public-profile-grid, .profile-video-grid { grid-template-columns: 1fr; }
   .social-platform-row { grid-template-columns: 1fr; }
   .public-profile-identity { align-items: start; }
   .public-profile-title h2 { font-size: 22px; }
+  .founder-search { min-width: 100%; }
+  .founder-inline-form { display: grid; grid-template-columns: 1fr; }
 }
 .image-fallback-shell:not(.image-load-failed) > .image-fallback-hidden { display: none !important; }
 .image-fallback-shell.image-load-failed > img { display: none !important; }

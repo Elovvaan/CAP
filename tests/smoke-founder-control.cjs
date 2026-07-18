@@ -70,6 +70,13 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+function assertSafeFounderPayload(payload) {
+  const text = JSON.stringify(payload).toLowerCase();
+  for (const forbidden of ["password_hash", "session_token", "cap_session", "cap_founder_password"]) {
+    assert(!text.includes(forbidden), `Founder response leaked ${forbidden}`);
+  }
+}
+
 async function register(displayName, email) {
   const result = await request("/api/auth/register", {
     method: "POST",
@@ -115,6 +122,40 @@ async function login(email, password = "SamePassword123!") {
     const adminDenied = await request("/api/founder/control", { headers: { Cookie: adminLogin.cookie } });
     assert(adminDenied.response.status === 403, "Admin reached founder-only control endpoint");
 
+    const profileUpdate = await request("/api/my-profile", {
+      method: "POST",
+      headers: { Cookie: creator.cookie },
+      body: JSON.stringify({
+        name: "Creator User",
+        handle: "@creator",
+        role: "Director",
+        category: "Film",
+        bio: "Builds community stories.",
+        skills: "editing, camera",
+        location: "Denver",
+        collaborationInterests: "documentary",
+        lookingFor: "producers"
+      })
+    });
+    assert(profileUpdate.response.status === 200, "Creator profile setup failed");
+    const creatorId = profileUpdate.body.profile.id;
+
+    const circleCreate = await request("/api/circles", {
+      method: "POST",
+      headers: { Cookie: founder.cookie },
+      body: JSON.stringify({ name: "Founder Review Circle", detail: "Operational review group", accent: "violet" })
+    });
+    assert(circleCreate.response.status === 200, "Circle setup failed");
+    const circleId = circleCreate.body.circles[0].id;
+
+    const collaborationCreate = await request("/api/collaborations", {
+      method: "POST",
+      headers: { Cookie: creator.cookie },
+      body: JSON.stringify({ creatorId, title: "Review Collaboration", message: "Please review.", status: "Requested", progress: 15 })
+    });
+    assert(collaborationCreate.response.status === 200, "Collaboration setup failed");
+    const collaborationId = collaborationCreate.body.collaborations[0].id;
+
     const updateUser = await request("/api/founder/users", {
       method: "POST",
       headers: { Cookie: founder.cookie },
@@ -129,6 +170,87 @@ async function login(email, password = "SamePassword123!") {
       body: JSON.stringify({ userId: creator.user.id, status: "deactivated" })
     });
     assert(adminUserUpdate.response.status === 403, "Admin could use founder user management endpoint");
+
+    const creatorDeniedAction = await request("/api/founder/creators", {
+      method: "POST",
+      headers: { Cookie: creator.cookie },
+      body: JSON.stringify({ creatorId, action: "hide" })
+    });
+    assert(creatorDeniedAction.response.status === 403, "Creator could use founder creator management endpoint");
+
+    const adminDeniedAction = await request("/api/founder/creators", {
+      method: "POST",
+      headers: { Cookie: adminLogin.cookie },
+      body: JSON.stringify({ creatorId, action: "hide" })
+    });
+    assert(adminDeniedAction.response.status === 403, "Admin could use founder creator management endpoint");
+
+    const resetSessions = await request("/api/founder/users", {
+      method: "POST",
+      headers: { Cookie: founder.cookie },
+      body: JSON.stringify({ action: "reset-sessions", userId: adminId })
+    });
+    assert(resetSessions.response.status === 200, "Founder could not reset sessions");
+
+    const creatorReview = await request("/api/founder/creators", {
+      method: "POST",
+      headers: { Cookie: founder.cookie },
+      body: JSON.stringify({ creatorId, action: "review", note: "Founder review note" })
+    });
+    assert(creatorReview.response.status === 200, "Founder could not place creator under review");
+    assert(creatorReview.body.founderControl.creators.some((item) => item.id === creatorId && item.moderationStatus === "under_review"), "Creator review status did not persist");
+
+    const creatorHide = await request("/api/founder/creators", {
+      method: "POST",
+      headers: { Cookie: founder.cookie },
+      body: JSON.stringify({ creatorId, action: "hide", note: "Hidden during review" })
+    });
+    assert(creatorHide.response.status === 200, "Founder could not hide creator");
+    assert(creatorHide.body.founderControl.creators.some((item) => item.id === creatorId && item.visibilityStatus === "hidden"), "Creator hide status did not persist");
+
+    const creatorEdit = await request("/api/founder/creators", {
+      method: "POST",
+      headers: { Cookie: founder.cookie },
+      body: JSON.stringify({ creatorId, action: "edit", name: "Creator User Updated", role: "Producer", category: "Film", location: "Denver" })
+    });
+    assert(creatorEdit.response.status === 200, "Founder could not edit creator");
+    assert(creatorEdit.body.founderControl.creators.some((item) => item.id === creatorId && item.name === "Creator User Updated"), "Founder creator edit did not persist");
+
+    const reportCreate = await request("/api/founder/reports", {
+      method: "POST",
+      headers: { Cookie: founder.cookie },
+      body: JSON.stringify({ action: "create", targetType: "creator", targetId: String(creatorId), reason: "Smoke report" })
+    });
+    assert(reportCreate.response.status === 200 && reportCreate.body.founderControl.reportQueue.some((report) => report.reason === "Smoke report"), "Founder report creation failed");
+    const reportId = reportCreate.body.founderControl.reportQueue.find((report) => report.reason === "Smoke report").id;
+
+    const reportResolve = await request("/api/founder/reports", {
+      method: "POST",
+      headers: { Cookie: founder.cookie },
+      body: JSON.stringify({ action: "resolve", reportId, resolution: "Handled by smoke test" })
+    });
+    assert(reportResolve.response.status === 200 && reportResolve.body.founderControl.reportQueue.some((report) => report.id === reportId && report.status === "resolved"), "Founder report resolution failed");
+
+    const moderationLog = await request("/api/founder/moderation", {
+      method: "POST",
+      headers: { Cookie: founder.cookie },
+      body: JSON.stringify({ targetType: "creator", targetId: String(creatorId), action: "logged smoke moderation", note: "No sensitive data" })
+    });
+    assert(moderationLog.response.status === 200 && moderationLog.body.founderControl.auditLog.some((entry) => /logged smoke moderation/.test(entry.action)), "Founder moderation audit failed");
+
+    const circleManage = await request("/api/founder/circles", {
+      method: "POST",
+      headers: { Cookie: founder.cookie },
+      body: JSON.stringify({ circleId, status: "paused", detail: "Paused by smoke test" })
+    });
+    assert(circleManage.response.status === 200 && circleManage.body.founderControl.circles.some((circle) => circle.id === circleId && circle.status === "paused"), "Founder circle management failed");
+
+    const collaborationClose = await request("/api/founder/collaborations", {
+      method: "POST",
+      headers: { Cookie: founder.cookie },
+      body: JSON.stringify({ collaborationId, action: "close-spam", note: "Smoke spam close" })
+    });
+    assert(collaborationClose.response.status === 200 && collaborationClose.body.founderControl.collaborations.some((item) => item.id === collaborationId && item.moderationStatus === "spam"), "Founder collaboration moderation failed");
 
     const settings = await request("/api/founder/settings", {
       method: "POST",
@@ -145,11 +267,23 @@ async function login(email, password = "SamePassword123!") {
     assert(maintenance.response.status === 200, "Founder maintenance action failed");
     assert(maintenance.body.founderControl.auditLog.some((entry) => /cleared discovery cache/.test(entry.action)), "Founder audit log did not record maintenance");
 
+    for (const action of ["cleanup-expired-sessions", "verify-uploads", "backup-database"]) {
+      const maintenanceAction = await request("/api/founder/maintenance", {
+        method: "POST",
+        headers: { Cookie: founder.cookie },
+        body: JSON.stringify({ action })
+      });
+      assert(maintenanceAction.response.status === 200, `Founder maintenance action failed: ${action}`);
+      assertSafeFounderPayload(maintenanceAction.body);
+    }
+
     const creatorState = await request("/api/state", { headers: { Cookie: creator.cookie } });
     assert(creatorState.response.status === 200 && creatorState.body.currentUser.accountType === "creator", "Creator dashboard state failed");
 
     const appScript = fs.readFileSync(path.join(projectRoot, "dist", "assets", "cap-local.js"), "utf8");
     assert(appScript.includes("Founder Control Center") && appScript.includes("Creator Mode") && appScript.includes("founderMode"), "Founder Control UI switch is not present in built app");
+    assert(appScript.includes("data-founder-user-action") && appScript.includes("founder-nav-group") && appScript.includes("Create Safe Backup"), "Founder workspace UI controls are not present in built app");
+    assertSafeFounderPayload(founderControl.body);
 
     console.log("smoke-founder-control ok");
   } finally {
