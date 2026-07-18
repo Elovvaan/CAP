@@ -256,6 +256,18 @@ function initializeDatabase() {
       detail TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS founder_reports (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      reporter_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      target_type TEXT NOT NULL DEFAULT '',
+      target_id TEXT NOT NULL DEFAULT '',
+      reason TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'open',
+      resolution TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
   `);
 
   const requiredCreatorColumns = [
@@ -276,6 +288,12 @@ function initializeDatabase() {
   addColumnIfMissing("messages", "recipient_user_id", "recipient_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL");
   addColumnIfMissing("contribution_activity", "user_id", "user_id INTEGER REFERENCES users(id) ON DELETE SET NULL");
   addColumnIfMissing("platform_links", "handle", "handle TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing("creators", "visibility_status", "visibility_status TEXT NOT NULL DEFAULT 'visible'");
+  addColumnIfMissing("creators", "moderation_status", "moderation_status TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing("creators", "moderation_note", "moderation_note TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing("creator_circles", "status", "status TEXT NOT NULL DEFAULT 'active'");
+  addColumnIfMissing("collaboration_requests", "moderation_status", "moderation_status TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing("collaboration_requests", "moderation_note", "moderation_note TEXT NOT NULL DEFAULT ''");
   rebuildSavedCreatorsForUsers();
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_creators_user_id ON creators(user_id);
@@ -290,6 +308,7 @@ function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_creator_follows_user ON creator_follows(follower_user_id, creator_id);
     CREATE INDEX IF NOT EXISTS idx_creator_follows_creator ON creator_follows(creator_id);
     CREATE INDEX IF NOT EXISTS idx_founder_audit_log_created ON founder_audit_log(created_at);
+    CREATE INDEX IF NOT EXISTS idx_founder_reports_status ON founder_reports(status, created_at);
   `);
   initializeFounderUser();
 }
@@ -451,6 +470,35 @@ function founderAudit(user, action, targetType = "", targetId = "", detail = "")
     "INSERT INTO founder_audit_log (founder_user_id, action, target_type, target_id, detail) VALUES (?, ?, ?, ?, ?)",
     [user?.id || null, sanitizeText(action), sanitizeText(targetType), sanitizeText(targetId), sanitizeText(detail)]
   );
+}
+
+function founderBoolean(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  return ["1", "true", "on", "yes"].includes(String(value).toLowerCase());
+}
+
+function founderStatus(value, allowed, fallback) {
+  const next = sanitizeText(value) || fallback;
+  if (!allowed.includes(next)) throw new Error(`Status must be one of: ${allowed.join(", ")}.`);
+  return next;
+}
+
+function createFounderBackup(user) {
+  const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+  const backupPath = path.join(dataDir, `cap-founder-backup-${stamp}.db`);
+  fs.copyFileSync(dbPath, backupPath);
+  setSetting(`maintenance:backup:${stamp}`, "created");
+  founderAudit(user, "created safe backup", "maintenance", stamp, "SQLite database copied to persistent data storage");
+  return stamp;
+}
+
+function verifyUploads() {
+  const references = all("SELECT id, image, banner FROM creators").flatMap((creator) => [
+    { creatorId: creator.id, type: "image", value: creator.image },
+    { creatorId: creator.id, type: "banner", value: creator.banner }
+  ]).filter((item) => String(item.value || "").startsWith("data/uploads/"));
+  const missing = references.filter((item) => !fs.existsSync(path.join(uploadDir, path.basename(item.value))));
+  return { checked: references.length, missing: missing.length };
 }
 
 function configuredFounderEmail(options = {}) {
@@ -1167,6 +1215,7 @@ function getFounderControlCenter(user) {
   const totalCircles = get("SELECT COUNT(*) AS count FROM creator_circles").count;
   const activeCollaborations = get("SELECT COUNT(*) AS count FROM collaboration_requests WHERE status != 'Completed'").count;
   const settings = getSettings();
+  const uploadCheck = verifyUploads();
   return {
     overview: {
       totalUsers,
@@ -1188,6 +1237,7 @@ function getFounderControlCenter(user) {
     `),
     creators: all(`
       SELECT c.id, c.name, c.handle, c.role, c.category, c.location, c.updated_at AS updatedAt,
+             c.visibility_status AS visibilityStatus, c.moderation_status AS moderationStatus, c.moderation_note AS moderationNote,
              u.email AS ownerEmail, u.account_type AS ownerAccountType, u.status AS ownerStatus
       FROM creators c
       LEFT JOIN users u ON u.id = c.user_id
@@ -1199,15 +1249,29 @@ function getFounderControlCenter(user) {
       creatorsMissingImages: get("SELECT COUNT(*) AS count FROM creators WHERE image = '' OR banner = ''").count,
       creatorsMissingDescriptions: get("SELECT COUNT(*) AS count FROM creators WHERE description = ''").count,
       openCollaborations: activeCollaborations,
-      orphanCreators: get("SELECT COUNT(*) AS count FROM creators WHERE user_id IS NULL").count
+      orphanCreators: get("SELECT COUNT(*) AS count FROM creators WHERE user_id IS NULL").count,
+      hiddenCreators: get("SELECT COUNT(*) AS count FROM creators WHERE visibility_status = 'hidden'").count,
+      creatorsUnderReview: get("SELECT COUNT(*) AS count FROM creators WHERE moderation_status = 'under_review'").count,
+      collaborationsFlagged: get("SELECT COUNT(*) AS count FROM collaboration_requests WHERE moderation_status != ''").count
     },
     reports: {
       activityEvents: get("SELECT COUNT(*) AS count FROM contribution_activity").count,
       saves: get("SELECT COUNT(*) AS count FROM saved_creators").count,
       follows: get("SELECT COUNT(*) AS count FROM creator_follows").count,
       views: get("SELECT COUNT(*) AS count FROM creator_views").count,
-      hides: get("SELECT COUNT(*) AS count FROM creator_hides").count
+      hides: get("SELECT COUNT(*) AS count FROM creator_hides").count,
+      openReports: get("SELECT COUNT(*) AS count FROM founder_reports WHERE status = 'open'").count,
+      resolvedReports: get("SELECT COUNT(*) AS count FROM founder_reports WHERE status = 'resolved'").count,
+      dismissedReports: get("SELECT COUNT(*) AS count FROM founder_reports WHERE status = 'dismissed'").count
     },
+    reportQueue: all(`
+      SELECT r.id, r.target_type AS targetType, r.target_id AS targetId, r.reason, r.status, r.resolution,
+             r.created_at AS createdAt, r.updated_at AS updatedAt, u.email AS reporterEmail
+      FROM founder_reports r
+      LEFT JOIN users u ON u.id = r.reporter_user_id
+      ORDER BY CASE r.status WHEN 'open' THEN 0 WHEN 'resolved' THEN 1 ELSE 2 END, r.created_at DESC, r.id DESC
+      LIMIT 100
+    `),
     analytics: {
       mostViewedCreators: all(`
         SELECT c.id, c.name, COUNT(v.id) AS count
@@ -1244,7 +1308,7 @@ function getFounderControlCenter(user) {
       `)
     },
     circles: all(`
-      SELECT c.id, c.name, c.detail, c.accent, COUNT(m.creator_id) AS members, c.created_at AS createdAt
+      SELECT c.id, c.name, c.detail, c.accent, c.status, COUNT(m.creator_id) AS members, c.created_at AS createdAt
       FROM creator_circles c
       LEFT JOIN circle_membership m ON m.circle_id = c.id
       GROUP BY c.id
@@ -1252,7 +1316,8 @@ function getFounderControlCenter(user) {
       LIMIT 100
     `),
     collaborations: all(`
-      SELECT cr.id, cr.title, cr.status, cr.progress, cr.created_at AS createdAt, c.name AS creatorName, u.email AS requesterEmail
+      SELECT cr.id, cr.title, cr.status, cr.progress, cr.moderation_status AS moderationStatus, cr.moderation_note AS moderationNote,
+             cr.created_at AS createdAt, c.name AS creatorName, u.email AS requesterEmail
       FROM collaboration_requests cr
       LEFT JOIN creators c ON c.id = cr.creator_id
       LEFT JOIN users u ON u.id = cr.requester_user_id
@@ -1269,12 +1334,19 @@ function getFounderControlCenter(user) {
       storage: isHosted ? "persistent hosted storage" : "local app data",
       database: "SQLite",
       hostMode: isHosted ? "hosted" : "local desktop",
-      auditEvents: get("SELECT COUNT(*) AS count FROM founder_audit_log").count
+      auditEvents: get("SELECT COUNT(*) AS count FROM founder_audit_log").count,
+      activeSessions: get("SELECT COUNT(*) AS count FROM sessions WHERE expires_at > ?", [new Date().toISOString()]).count,
+      uploadsChecked: uploadCheck.checked,
+      uploadsMissing: uploadCheck.missing,
+      persistence: isHosted ? "Railway volume or configured data directory" : "local data directory",
+      startup: "last startup completed"
     },
     maintenanceTools: {
       discoveryCacheUsers: discoveryCache.size,
       databaseBackups: all("SELECT key, value FROM application_settings WHERE key LIKE 'maintenance:%' ORDER BY key").length,
-      staleSessions: get("SELECT COUNT(*) AS count FROM sessions WHERE expires_at <= ?", [new Date().toISOString()]).count
+      staleSessions: get("SELECT COUNT(*) AS count FROM sessions WHERE expires_at <= ?", [new Date().toISOString()]).count,
+      uploadsChecked: uploadCheck.checked,
+      uploadsMissing: uploadCheck.missing
     },
     auditLog: all(`
       SELECT a.id, a.action, a.target_type AS targetType, a.target_id AS targetId, a.detail, a.created_at AS createdAt,
@@ -1559,8 +1631,13 @@ async function handleApi(request, response, url) {
       if (!targetId) throw new Error("User is required.");
       const target = get("SELECT * FROM users WHERE id = ?", [targetId]);
       if (!target) throw new Error("User was not found.");
+      if (sanitizeText(payload.action) === "reset-sessions") {
+        run("DELETE FROM sessions WHERE user_id = ?", [targetId]);
+        founderAudit(user, "reset user sessions", "user", String(targetId), target.email);
+        return json(response, 200, { founderControl: getFounderControlCenter(user) });
+      }
       const status = sanitizeText(payload.status) || target.status;
-      const isAdmin = payload.isAdmin === undefined ? Boolean(target.is_admin) : ["1", "true", "on"].includes(String(payload.isAdmin).toLowerCase());
+      const isAdmin = founderBoolean(payload.isAdmin, Boolean(target.is_admin));
       const accountType = target.account_type === "founder" ? "founder" : "creator";
       if (!["active", "deactivated"].includes(status)) throw new Error("User status must be active or deactivated.");
       if (target.account_type === "founder" && target.id !== user.id) throw new Error("Only the configured founder can hold founder status.");
@@ -1573,6 +1650,115 @@ async function handleApi(request, response, url) {
         targetId
       ]);
       founderAudit(user, "updated user account", "user", String(targetId), `status=${status}; admin=${target.account_type === "founder" ? 1 : (isAdmin ? 1 : 0)}`);
+      return json(response, 200, { founderControl: getFounderControlCenter(user) });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/founder/creators") {
+      requireFounder(user);
+      const payload = await readJson(request);
+      const creatorId = Number(payload.creatorId);
+      if (!creatorId) throw new Error("Creator is required.");
+      const creator = get("SELECT * FROM creators WHERE id = ?", [creatorId]);
+      if (!creator) throw new Error("Creator was not found.");
+      const action = sanitizeText(payload.action);
+      if (action === "edit") {
+        run(`
+          UPDATE creators
+          SET name = COALESCE(NULLIF(?, ''), name),
+              role = COALESCE(NULLIF(?, ''), role),
+              category = COALESCE(NULLIF(?, ''), category),
+              location = COALESCE(NULLIF(?, ''), location),
+              description = COALESCE(NULLIF(?, ''), description),
+              updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?
+        `, [
+          sanitizeText(payload.name),
+          sanitizeText(payload.role),
+          sanitizeText(payload.category),
+          sanitizeText(payload.location),
+          sanitizeText(payload.description ?? payload.bio),
+          creatorId
+        ]);
+        founderAudit(user, "edited creator as founder", "creator", String(creatorId), creator.name);
+      } else {
+        const visibility = action === "hide" ? "hidden" : action === "unhide" ? "visible" : (sanitizeText(payload.visibilityStatus) || creator.visibility_status || "visible");
+        const moderation = action === "review" ? "under_review" : action === "clear-review" ? "" : (sanitizeText(payload.moderationStatus) || creator.moderation_status || "");
+        run("UPDATE creators SET visibility_status = ?, moderation_status = ?, moderation_note = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [
+          founderStatus(visibility, ["visible", "hidden"], "visible"),
+          founderStatus(moderation, ["", "under_review", "approved", "rejected"], ""),
+          sanitizeText(payload.note ?? payload.moderationNote),
+          creatorId
+        ]);
+        founderAudit(user, `creator ${action || "moderation updated"}`, "creator", String(creatorId), sanitizeText(payload.note || creator.name));
+      }
+      invalidateDiscovery();
+      return json(response, 200, { founderControl: getFounderControlCenter(user) });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/founder/moderation") {
+      requireFounder(user);
+      const payload = await readJson(request);
+      const targetType = sanitizeText(payload.targetType);
+      const targetId = sanitizeText(payload.targetId);
+      if (!targetType || !targetId) throw new Error("Moderation target is required.");
+      founderAudit(user, sanitizeText(payload.action) || "logged moderation action", targetType, targetId, sanitizeText(payload.note));
+      return json(response, 200, { founderControl: getFounderControlCenter(user) });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/founder/reports") {
+      requireFounder(user);
+      const payload = await readJson(request);
+      const action = sanitizeText(payload.action);
+      if (action === "create") {
+        run("INSERT INTO founder_reports (reporter_user_id, target_type, target_id, reason, status) VALUES (?, ?, ?, ?, 'open')", [
+          user.id,
+          sanitizeText(payload.targetType),
+          sanitizeText(payload.targetId),
+          sanitizeText(payload.reason)
+        ]);
+        founderAudit(user, "created founder report", sanitizeText(payload.targetType), sanitizeText(payload.targetId), sanitizeText(payload.reason));
+      } else {
+        const reportId = Number(payload.reportId);
+        if (!reportId) throw new Error("Report is required.");
+        const status = founderStatus(action === "resolve" ? "resolved" : action === "dismiss" ? "dismissed" : sanitizeText(payload.status), ["open", "resolved", "dismissed"], "open");
+        run("UPDATE founder_reports SET status = ?, resolution = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [status, sanitizeText(payload.resolution), reportId]);
+        founderAudit(user, `report ${status}`, "report", String(reportId), sanitizeText(payload.resolution));
+      }
+      return json(response, 200, { founderControl: getFounderControlCenter(user) });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/founder/circles") {
+      requireFounder(user);
+      const payload = await readJson(request);
+      const circleId = Number(payload.circleId);
+      if (!circleId) throw new Error("Circle is required.");
+      const status = founderStatus(payload.status, ["active", "paused", "archived"], "active");
+      run("UPDATE creator_circles SET name = COALESCE(NULLIF(?, ''), name), detail = COALESCE(NULLIF(?, ''), detail), status = ? WHERE id = ?", [
+        sanitizeText(payload.name),
+        sanitizeText(payload.detail),
+        status,
+        circleId
+      ]);
+      founderAudit(user, "managed circle", "circle", String(circleId), `status=${status}`);
+      return json(response, 200, { founderControl: getFounderControlCenter(user) });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/founder/collaborations") {
+      requireFounder(user);
+      const payload = await readJson(request);
+      const collaborationId = Number(payload.collaborationId);
+      if (!collaborationId) throw new Error("Collaboration is required.");
+      const action = sanitizeText(payload.action);
+      const status = action === "close-spam" ? "Closed - Spam" : action === "close-abuse" ? "Closed - Abuse" : (sanitizeText(payload.status) || "Requested");
+      const moderationStatus = action === "close-spam" ? "spam" : action === "close-abuse" ? "abuse" : sanitizeText(payload.moderationStatus);
+      run("UPDATE collaboration_requests SET status = ?, moderation_status = ?, moderation_note = ?, progress = CASE WHEN ? LIKE 'Closed%' THEN 100 ELSE progress END WHERE id = ?", [
+        status,
+        moderationStatus,
+        sanitizeText(payload.note),
+        status,
+        collaborationId
+      ]);
+      founderAudit(user, `collaboration ${action || "reviewed"}`, "collaboration", String(collaborationId), sanitizeText(payload.note || status));
       return json(response, 200, { founderControl: getFounderControlCenter(user) });
     }
 
@@ -1591,9 +1777,21 @@ async function handleApi(request, response, url) {
       requireFounder(user);
       const payload = await readJson(request);
       const action = sanitizeText(payload.action);
-      if (action !== "clear-discovery-cache") throw new Error("Unsupported maintenance action.");
-      discoveryCache.clear();
-      founderAudit(user, "cleared discovery cache", "maintenance", "discovery-cache", "Founder maintenance tool");
+      if (action === "clear-discovery-cache") {
+        discoveryCache.clear();
+        founderAudit(user, "cleared discovery cache", "maintenance", "discovery-cache", "Founder maintenance tool");
+      } else if (action === "cleanup-expired-sessions") {
+        const result = run("DELETE FROM sessions WHERE expires_at <= ?", [new Date().toISOString()]);
+        founderAudit(user, "cleaned expired sessions", "maintenance", "sessions", `${result.changes || 0} removed`);
+      } else if (action === "verify-uploads") {
+        const check = verifyUploads();
+        founderAudit(user, "verified uploads", "maintenance", "uploads", `${check.checked} checked; ${check.missing} missing`);
+      } else if (action === "backup-database") {
+        const stamp = createFounderBackup(user);
+        founderAudit(user, "database backup complete", "maintenance", stamp, "Safe backup created");
+      } else {
+        throw new Error("Unsupported maintenance action.");
+      }
       return json(response, 200, { founderControl: getFounderControlCenter(user) });
     }
 
