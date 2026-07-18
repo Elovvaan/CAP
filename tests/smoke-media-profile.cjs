@@ -52,8 +52,9 @@ async function waitForServer() {
       const health = await request("/health");
       if (health.response.ok) return;
     } catch {
-      await wait(250);
+      // Keep retrying until the server is ready.
     }
+    await wait(250);
   }
   throw new Error(`CAP server did not start. ${output}`);
 }
